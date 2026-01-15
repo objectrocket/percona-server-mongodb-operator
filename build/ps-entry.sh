@@ -490,6 +490,10 @@ if [[ $originalArgOne == mongo* ]]; then
 		_mongod_hack_ensure_arg --logappend "${mongodHackedArgs[@]}"
 	fi
 
+	_mongod_hack_ensure_no_arg --relaxPermChecks "${mongodHackedArgs[@]}"
+	_mongod_hack_ensure_no_arg --enableEncryption "${mongodHackedArgs[@]}"
+	_mongod_hack_ensure_no_arg_val --encryptionKeyFile "${mongodHackedArgs[@]}"
+
 	set -- "${mongodHackedArgs[@]}"
 
 	# MongoDB 3.6+ defaults to localhost-only binding
