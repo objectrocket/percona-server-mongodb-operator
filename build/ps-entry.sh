@@ -19,6 +19,7 @@ if [[ $originalArgOne == mongo* ]] && [ "$(id -u)" = '0' ]; then
 	chown --dereference mongodb "/proc/$$/fd/1" "/proc/$$/fd/2" || :
 	# ignore errors thanks to https://github.com/docker-library/mongo/issues/149
 
+
 	exec gosu mongodb:1001 "${BASH_SOURCE[0]}" "$@"
 fi
 
@@ -460,6 +461,30 @@ if [[ $originalArgOne == mongo* ]]; then
 		if [ -f "${LDAP_SSL_DIR}/ca.crt" ]; then
 			echo "TLS_CACERT ${LDAP_SSL_DIR}/ca.crt" >/etc/openldap/ldap.conf
 		fi
+
+		ls -l /etc/mongodb-secrets
+	fi
+
+	keyFilePath=""
+	if _mongod_hack_have_arg --keyFile "${mongodHackedArgs[@]}"; then
+		keyFilePath="$(_mongod_hack_get_arg_val --keyFile "${mongodHackedArgs[@]}")"
+	elif _parse_config "${mongodHackedArgs[@]}"; then
+		keyFilePath="$(jq -r '.security.keyFile // empty' "$jsonConfigFile")"
+	fi
+
+	if [ -n "$keyFilePath" ] && [ -f "$keyFilePath" ]; then
+		keyFileTmp="${TMPDIR:-/tmp}/mongodb-keyfile"
+		if [ "$keyFilePath" != "$keyFileTmp" ]; then
+			if ! cp -f "$keyFilePath" "$keyFileTmp"; then
+				echo >&2 "error: failed to copy keyFile from $keyFilePath to $keyFileTmp"
+				exit 1
+			fi
+		fi
+		if ! chmod 0400 "$keyFileTmp"; then
+			echo >&2 "error: failed to chmod keyFile $keyFileTmp"
+			exit 1
+		fi
+		_mongod_hack_ensure_arg_val --keyFile "$keyFileTmp" "${mongodHackedArgs[@]}"
 	fi
 
 	if [ "$MONGODB_VERSION" != 'v4.0' ]; then
