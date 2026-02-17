@@ -461,8 +461,6 @@ if [[ $originalArgOne == mongo* ]]; then
 		if [ -f "${LDAP_SSL_DIR}/ca.crt" ]; then
 			echo "TLS_CACERT ${LDAP_SSL_DIR}/ca.crt" >/etc/openldap/ldap.conf
 		fi
-
-		ls -l /etc/mongodb-secrets
 	fi
 
 	keyFilePath=""
