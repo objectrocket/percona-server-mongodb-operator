@@ -19,7 +19,6 @@ if [[ $originalArgOne == mongo* ]] && [ "$(id -u)" = '0' ]; then
 	chown --dereference mongodb "/proc/$$/fd/1" "/proc/$$/fd/2" || :
 	# ignore errors thanks to https://github.com/docker-library/mongo/issues/149
 
-
 	exec gosu mongodb:1001 "${BASH_SOURCE[0]}" "$@"
 fi
 
