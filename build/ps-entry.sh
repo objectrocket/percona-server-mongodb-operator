@@ -462,6 +462,28 @@ if [[ $originalArgOne == mongo* ]]; then
 		fi
 	fi
 
+	keyFilePath=""
+	if _mongod_hack_have_arg --keyFile "${mongodHackedArgs[@]}"; then
+		keyFilePath="$(_mongod_hack_get_arg_val --keyFile "${mongodHackedArgs[@]}")"
+	elif _parse_config "${mongodHackedArgs[@]}"; then
+		keyFilePath="$(jq -r '.security.keyFile // empty' "$jsonConfigFile")"
+	fi
+
+	if [ -n "$keyFilePath" ] && [ -f "$keyFilePath" ]; then
+		keyFileTmp="${TMPDIR:-/tmp}/mongodb-keyfile"
+		if [ "$keyFilePath" != "$keyFileTmp" ]; then
+			if ! cp -f "$keyFilePath" "$keyFileTmp"; then
+				echo >&2 "error: failed to copy keyFile from $keyFilePath to $keyFileTmp"
+				exit 1
+			fi
+		fi
+		if ! chmod 0400 "$keyFileTmp"; then
+			echo >&2 "error: failed to chmod keyFile $keyFileTmp"
+			exit 1
+		fi
+		_mongod_hack_ensure_arg_val --keyFile "$keyFileTmp" "${mongodHackedArgs[@]}"
+	fi
+
 	if [ "$MONGODB_VERSION" != 'v4.0' ]; then
 		_mongod_hack_rename_arg '--sslAllowInvalidCertificates' '--tlsAllowInvalidCertificates' "${mongodHackedArgs[@]}"
 		_mongod_hack_rename_arg '--sslAllowInvalidHostnames' '--tlsAllowInvalidHostnames' "${mongodHackedArgs[@]}"
