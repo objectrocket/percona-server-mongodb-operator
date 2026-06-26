@@ -1,0 +1,44 @@
+{
+  "extends": ["config:recommended", "schedule:weekly"],
+  "labels": ["dependencies"],
+  "dependencyDashboard": true,
+  "postUpdateOptions": ["gomodTidy"],
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchUpdateTypes": ["major"],
+      "automerge": false
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "automerge": true
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "automerge": false
+    },
+    {
+      "matchPackagePatterns": ["k8s.io/*", "sigs.k8s.io/*"],
+      "groupName": "kubernetes dependencies",
+      "enabled": false
+    },
+    {
+      "matchPackagePatterns": ["go.opentelemetry.io/*"],
+      "groupName": "opentelemetry dependencies",
+      "enabled": false
+    },
+    {
+      "description": "Disable updates for packages managed by upstream Percona",
+      "matchPackagePatterns": [
+        "github.com/percona/*",
+        "github.com/Percona-Lab/*"
+      ],
+      "enabled": false
+    }
+  ]
+}
