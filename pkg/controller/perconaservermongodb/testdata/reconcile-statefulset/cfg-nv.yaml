@@ -60,7 +60,6 @@ spec:
         - --port=27017
         - --replSet=cfg
         - --storageEngine=wiredTiger
-        - --relaxPermChecks
         - --sslAllowInvalidCertificates
         - --clusterAuthMode=x509
         - --tlsMode=preferTLS

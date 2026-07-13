@@ -201,7 +201,7 @@ func TestMongosContainer(t *testing.T) {
 	assert.Contains(t, container.Args, "mongos")
 	assert.Contains(t, container.Args, "--bind_ip_all")
 	assert.Contains(t, container.Args, "--configdb")
-	assert.Contains(t, container.Args, "--relaxPermChecks")
+	assert.NotContains(t, container.Args, "--relaxPermChecks")
 
 	// Ports
 	assert.Len(t, container.Ports, 1)

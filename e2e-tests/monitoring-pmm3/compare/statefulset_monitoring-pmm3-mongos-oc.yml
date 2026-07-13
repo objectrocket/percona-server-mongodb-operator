@@ -55,7 +55,6 @@ spec:
             - --sslAllowInvalidCertificates
             - --configdb
             - cfg/monitoring-pmm3-cfg-0.monitoring-pmm3-cfg.NAME_SPACE.svc.cluster.local:27019,monitoring-pmm3-cfg-1.monitoring-pmm3-cfg.NAME_SPACE.svc.cluster.local:27019,monitoring-pmm3-cfg-2.monitoring-pmm3-cfg.NAME_SPACE.svc.cluster.local:27019
-            - --relaxPermChecks
             - --clusterAuthMode=x509
             - --tlsMode=requireTLS
             - --config=/etc/mongos-config/mongos.conf

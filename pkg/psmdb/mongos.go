@@ -257,7 +257,6 @@ func mongosContainerArgs(cr *api.PerconaServerMongoDB, useConfigFile bool, cfgIn
 	args = append(args, []string{
 		"--configdb",
 		configDB,
-		"--relaxPermChecks",
 	}...)
 
 	// If auth is disabled, we consider that TLS should be also disabled
