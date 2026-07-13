@@ -1,0 +1,58 @@
+name: Version Bump Label Check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-label:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for code changes
+        id: changes
+        uses: dorny/paths-filter@v4
+        with:
+          filters: |
+            code:
+              - 'pkg/**'
+              - 'cmd/**'
+              - 'build/**'
+              - 'config/**'
+              - 'deploy/**'
+
+      - name: Check for bump label
+        if: steps.changes.outputs.code == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LABELS=$(gh api repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels --jq '[.[].name]')
+          echo "Labels found: $LABELS"
+          SKIP=$(echo "$LABELS" | jq 'map(select(. == "skip-release")) | length')
+
+          if [ "$SKIP" -gt 0 ]; then
+            echo "✅ skip-release label found, no version bump required"
+            exit 0
+          fi
+
+          PATCH=$(echo "$LABELS" | jq 'map(select(. == "bump:patch")) | length')
+          MINOR=$(echo "$LABELS" | jq 'map(select(. == "bump:minor")) | length')
+          MAJOR=$(echo "$LABELS" | jq 'map(select(. == "bump:major")) | length')
+          COUNT=$((PATCH + MINOR + MAJOR))
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::PR must have exactly one bump label (bump:patch, bump:minor, or bump:major) or skip-release"
+            exit 1
+          elif [ "$COUNT" -gt 1 ]; then
+            echo "::error::PR has multiple bump labels. Use exactly one of: bump:patch, bump:minor, bump:major"
+            exit 1
+          fi
+
+          echo "✅ Bump label found"
+
+      - name: Skip label check
+        if: steps.changes.outputs.code == 'false'
+        run: echo "✅ No code changes detected, skipping label check"
