@@ -45,7 +45,7 @@ func TestCRDVersionLabel(t *testing.T) {
 		if !slices.Contains(crdNames, crd.Name) {
 			continue
 		}
-		expectedVersion := "v" + version.Version()
+		expectedVersion := "v" + version.FullVersion()
 		expectedLabels := naming.Labels()
 		expectedLabels[naming.LabelKubernetesOperatorVersion] = expectedVersion
 		expectedLabels[naming.LabelKubernetesComponent] = "crd"
