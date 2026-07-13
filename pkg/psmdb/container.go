@@ -234,7 +234,6 @@ func containerArgs(ctx context.Context, cr *api.PerconaServerMongoDB, replset *a
 		"--port="+strconv.Itoa(int(replset.GetPort())),
 		"--replSet="+replSetName,
 		"--storageEngine="+string(replset.Storage.Engine),
-		"--relaxPermChecks",
 	)
 
 	if *cr.Spec.TLS.AllowInvalidCertificates || cr.CompareVersion("1.16.0") < 0 {
