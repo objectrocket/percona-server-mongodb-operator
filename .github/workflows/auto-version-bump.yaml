@@ -1,0 +1,206 @@
+name: Auto Version Bump
+
+on:
+  pull_request:
+    types: [opened, synchronize, labeled]
+    paths:
+      - 'pkg/**'
+      - 'cmd/**'
+      - 'build/**'
+      - 'config/**'
+      - 'deploy/**'
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  auto-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine bump type from label
+        id: label
+        run: |
+          LABELS='${{ toJSON(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | jq -e 'map(select(. == "bump:major")) | length > 0' > /dev/null; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | jq -e 'map(select(. == "bump:minor")) | length > 0' > /dev/null; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | jq -e 'map(select(. == "bump:patch")) | length > 0' > /dev/null; then
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR branch
+        if: steps.label.outputs.type != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch base branch
+        if: steps.label.outputs.type != ''
+        run: git fetch origin ${{ github.event.pull_request.base.ref }}
+
+      - name: Configure git
+        if: steps.label.outputs.type != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve version conflict with base
+        if: steps.label.outputs.type != ''
+        id: conflict
+        run: |
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+          VERSION_FILE="pkg/version/version.txt"
+
+          # Check if version file has a merge conflict with base
+          if git merge --no-commit --no-ff "$BASE_REF" 2>/dev/null; then
+            git merge --abort 2>/dev/null || true
+            echo "resolved=false" >> "$GITHUB_OUTPUT"
+          else
+            CONFLICTED=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+            git merge --abort 2>/dev/null || true
+
+            # Check if conflicts are only in the version file
+            VERSION_ONLY=true
+            for f in $CONFLICTED; do
+              if [ "$f" != "$VERSION_FILE" ]; then
+                VERSION_ONLY=false
+                break
+              fi
+            done
+
+            if [ "$VERSION_ONLY" = "true" ]; then
+              echo "🔀 Version file conflict detected — will auto-resolve from base"
+              echo "resolved=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "resolved=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Merge base into PR (resolve version conflict)
+        if: steps.label.outputs.type != '' && steps.conflict.outputs.resolved == 'true'
+        run: |
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+          VERSION_FILE="pkg/version/version.txt"
+
+          # Start the merge, accept conflicts
+          git merge "$BASE_REF" --no-edit || true
+
+          # Resolve version file by taking theirs (will be overwritten by bump step)
+          git checkout --theirs "$VERSION_FILE" 2>/dev/null || true
+          git add "$VERSION_FILE"
+
+          # If there are other conflicts, abort
+          OTHER_CONFLICTS=$(git diff --name-only --diff-filter=U 2>/dev/null || true)
+          if [ -n "$OTHER_CONFLICTS" ]; then
+            echo "::error::Merge has conflicts beyond version file, cannot auto-resolve"
+            git merge --abort
+            exit 1
+          fi
+
+          git commit --no-edit
+
+      - name: Bump version
+        if: steps.label.outputs.type != ''
+        id: bump
+        run: |
+          BUMP_TYPE="${{ steps.label.outputs.type }}"
+          BASE_REF="origin/${{ github.event.pull_request.base.ref }}"
+          VERSION_FILE="pkg/version/version.txt"
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_REF" HEAD)
+
+          # Check if code in monitored directories changed (excluding version file)
+          CODE_CHANGED=$(echo "$CHANGED_FILES" | grep -E '^(pkg|cmd|build|config|deploy)/' | grep -v "^${VERSION_FILE}$" || true)
+          if [ -z "$CODE_CHANGED" ]; then
+            echo "No code changes detected, skipping bump"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Read current versions
+          BASE_VER=$(git show "$BASE_REF:$VERSION_FILE" 2>/dev/null | tr -d '[:space:]' || echo "1.22.0-0")
+          PR_VER=$(cat "$VERSION_FILE" | tr -d '[:space:]')
+
+          # Parse subversioned format: X.Y.Z-N
+          # Base version
+          BASE_SEMVER=$(echo "$BASE_VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+          BASE_SUB=$(echo "$BASE_VER" | grep -oE '\-[0-9]+$' | tr -d '-' || echo "0")
+          if [ -z "$BASE_SUB" ]; then BASE_SUB=0; fi
+
+          # PR version
+          PR_SEMVER=$(echo "$PR_VER" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
+          PR_SUB=$(echo "$PR_VER" | grep -oE '\-[0-9]+$' | tr -d '-' || echo "0")
+          if [ -z "$PR_SUB" ]; then PR_SUB=0; fi
+
+          # Compare: if PR version is already higher than base, skip (manual bump)
+          IFS='.' read -r b1 b2 b3 <<< "$BASE_SEMVER"
+          IFS='.' read -r p1 p2 p3 <<< "$PR_SEMVER"
+
+          ALREADY_BUMPED=false
+          if [ "$p1" -gt "$b1" ] 2>/dev/null; then
+            ALREADY_BUMPED=true
+          elif [ "$p1" -eq "$b1" ] && [ "$p2" -gt "$b2" ] 2>/dev/null; then
+            ALREADY_BUMPED=true
+          elif [ "$p1" -eq "$b1" ] && [ "$p2" -eq "$b2" ] && [ "$p3" -gt "$b3" ] 2>/dev/null; then
+            ALREADY_BUMPED=true
+          elif [ "$p1" -eq "$b1" ] && [ "$p2" -eq "$b2" ] && [ "$p3" -eq "$b3" ] && [ "$PR_SUB" -gt "$BASE_SUB" ] 2>/dev/null; then
+            ALREADY_BUMPED=true
+          fi
+
+          if [ "$ALREADY_BUMPED" = "true" ]; then
+            echo "✅ Version already bumped ($BASE_VER → $PR_VER), skipping"
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Bump based on type
+          # For this repo: bump:patch increments the -N subversion suffix
+          # bump:minor and bump:major bump the semver portion (for upstream rebases)
+          IFS='.' read -r major minor patch <<< "$BASE_SEMVER"
+          case "$BUMP_TYPE" in
+            major)
+              major=$((major + 1)); minor=0; patch=0
+              NEW_VER="${major}.${minor}.${patch}-1"
+              ;;
+            minor)
+              minor=$((minor + 1)); patch=0
+              NEW_VER="${major}.${minor}.${patch}-1"
+              ;;
+            patch)
+              NEW_SUB=$((BASE_SUB + 1))
+              NEW_VER="${BASE_SEMVER}-${NEW_SUB}"
+              ;;
+          esac
+
+          echo "🔄 Version: $BASE_VER → $NEW_VER ($BUMP_TYPE)"
+
+          # Write version file
+          printf '%s\n' "$NEW_VER" > "$VERSION_FILE"
+
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure trailing newline
+        if: steps.label.outputs.type != ''
+        run: |
+          VERSION_FILE="pkg/version/version.txt"
+          if [ -n "$(tail -c 1 "$VERSION_FILE")" ]; then
+            echo "" >> "$VERSION_FILE"
+            echo "Fixed missing trailing newline in $VERSION_FILE"
+          fi
+
+      - name: Commit and push
+        if: steps.label.outputs.type != ''
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add -A
+            git commit -m "chore: auto-bump version (${{ steps.label.outputs.type }})"
+            git push
+          fi
