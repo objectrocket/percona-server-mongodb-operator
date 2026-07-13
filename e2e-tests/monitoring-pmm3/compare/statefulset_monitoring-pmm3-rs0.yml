@@ -47,7 +47,6 @@ spec:
             - --port=27019
             - --replSet=rs0
             - --storageEngine=wiredTiger
-            - --relaxPermChecks
             - --sslAllowInvalidCertificates
             - --clusterAuthMode=x509
             - --tlsMode=requireTLS
