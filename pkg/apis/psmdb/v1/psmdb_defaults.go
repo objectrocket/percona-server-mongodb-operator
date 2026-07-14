@@ -685,10 +685,11 @@ func (rs *ReplsetSpec) IsEncryptionEnabled() (bool, error) {
 	}
 
 	if enabled == nil {
-		if rs.Storage.Engine == StorageEngineInMemory {
-			return false, nil // disabled for inMemory engine by default
-		}
-		return true, nil // true by default
+		// Default to disabled. Community MongoDB images do not support
+		// --enableEncryption (Percona Server feature). Users running Percona
+		// Server images can explicitly enable via security.enableEncryption: true
+		// in the replset configuration.
+		return false, nil
 	}
 	return *enabled, nil
 }
