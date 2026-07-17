@@ -64,6 +64,8 @@ spec:
         - --clusterAuthMode=x509
         - --tlsMode=preferTLS
         - --shardsvr
+        - --enableEncryption
+        - --encryptionKeyFile=/etc/mongodb-encryption/encryption-key
         - --wiredTigerCacheSizeGB=0.25
         - --wiredTigerIndexPrefixCompression=true
         - --quiet
@@ -144,6 +146,7 @@ spec:
         securityContext:
           runAsNonRoot: true
           runAsUser: 1001
+        topologySpreadConstraints: null
         volumeMounts:
         - mountPath: /data/db
           name: mongod-data
@@ -160,6 +163,9 @@ spec:
           name: bin
         - mountPath: /.mongodb
           name: mongosh
+        - mountPath: /etc/mongodb-encryption
+          name: my-cluster-name-mongodb-encryption-key
+          readOnly: true
         - mountPath: /etc/users-secret
           name: users-secret-file
         workingDir: /data/db
@@ -198,6 +204,11 @@ spec:
           name: reconcile-statefulset-cr-log-collector-config
           optional: true
         name: log-collector-volume
+      - name: my-cluster-name-mongodb-encryption-key
+        secret:
+          defaultMode: 288
+          optional: false
+          secretName: my-cluster-name-mongodb-encryption-key
       - name: ssl
         secret:
           defaultMode: 288
@@ -215,6 +226,3 @@ spec:
         name: mongod-data
   updateStrategy:
     type: OnDelete
-status:
-  availableReplicas: 0
-  replicas: 0
