@@ -7,11 +7,11 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -495,7 +495,7 @@ func (c *noopMongoClient) StopBalancer(ctx context.Context) error  { return nil 
 func (c *noopMongoClient) IsBalancerRunning(ctx context.Context) (bool, error) {
 	return false, nil
 }
-func (c *noopMongoClient) GetFCV(ctx context.Context) (string, error) { return "", nil }
+func (c *noopMongoClient) GetFCV(ctx context.Context) (string, error)       { return "", nil }
 func (c *noopMongoClient) SetFCV(ctx context.Context, version string) error { return nil }
 func (c *noopMongoClient) ListDBs(ctx context.Context) (mongo.DBList, error) {
 	return mongo.DBList{}, nil
