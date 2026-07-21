@@ -56,7 +56,50 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCustomUsers(ctx context.Context
 		return errors.Wrap(err, "handle users")
 	}
 
+	// For sharded clusters, custom users are created via mongos which stores them
+	// on the config server only. Individual shard replica sets maintain their own
+	// local admin databases and are unaware of users created at the cluster level.
+	// Only clusterSuperAdmin needs direct shard access for platform operations;
+	// other custom users should remain cluster-level only (accessed via mongos).
+	if cr.Spec.Sharding.Enabled {
+		shardUsers := filterShardUsers(cr.Spec.Users)
+		if len(shardUsers) > 0 {
+			shardCR := cr.DeepCopy()
+			shardCR.Spec.Users = shardUsers
+
+			for i := range cr.Spec.Replsets {
+				rs := cr.Spec.Replsets[i]
+				shardCli, err := r.mongoClientWithRole(ctx, cr, rs, api.RoleUserAdmin)
+				if err != nil {
+					log.Error(err, "failed to get mongo client for shard", "replset", rs.Name)
+					continue
+				}
+
+				if err := handleUsers(ctx, shardCR, shardCli, r.client); err != nil {
+					log.Error(err, "failed to handle users on shard", "replset", rs.Name)
+				}
+
+				if err := shardCli.Disconnect(ctx); err != nil {
+					log.Error(err, "failed to close shard mongo connection", "replset", rs.Name)
+				}
+			}
+		}
+	}
+
 	return nil
+}
+
+// filterShardUsers returns only the users that need to be created directly on
+// each shard replica set. Currently this is limited to clusterSuperAdmin which
+// requires direct shard access for platform operations (compaction, backups, etc).
+func filterShardUsers(users []api.User) []api.User {
+	var filtered []api.User
+	for i := range users {
+		if users[i].Name == "clusterSuperAdmin" {
+			filtered = append(filtered, users[i])
+		}
+	}
+	return filtered
 }
 
 func handleUsers(ctx context.Context, cr *api.PerconaServerMongoDB, mongoCli mongo.Client, client client.Client) error {
