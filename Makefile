@@ -94,7 +94,7 @@ kustomize: ## Download kustomize locally if necessary.
 
 ENVTEST = $(shell pwd)/bin/setup-envtest
 envtest: ## Download envtest-setup locally if necessary.
-	$(call go-get-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest@latest)
+	$(call go-get-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.23)
 
 SWAGGER = $(shell pwd)/bin/swagger
 swagger: ## Download swagger locally if necessary.
