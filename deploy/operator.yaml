@@ -60,3 +60,13 @@ spec:
               value: "false"
             - name: MAX_CONCURRENT_RECONCILES
               value: "1"
+            # REPLSET_RECONCILE_CONCURRENCY bounds how many replsets of a single
+            # cluster are reconciled in parallel. Default 8. Set to "1" to restore
+            # fully sequential reconciliation.
+            - name: REPLSET_RECONCILE_CONCURRENCY
+              value: "8"
+            # SHARD_ADD_CONCURRENCY bounds concurrent sh.addShard calls. MongoDB
+            # serializes shard addition through the config server's DDL coordinator,
+            # so this is clamped to 1-3. Default 1.
+            - name: SHARD_ADD_CONCURRENCY
+              value: "1"

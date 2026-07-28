@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -96,6 +97,13 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		new(vault.Provider),
 	}
 
+	replsetConcurrency := envIntOrDefault(mgr.GetLogger(), envReplsetConcurrency, defaultReplsetConcurrency, 1, 0)
+	shardAddConcurrency := envIntOrDefault(mgr.GetLogger(), envShardAddConcurrency, defaultShardAddConcurrency, 1, maxShardAddConcurrency)
+
+	mgr.GetLogger().Info("replset reconcile concurrency",
+		envReplsetConcurrency, replsetConcurrency,
+		envShardAddConcurrency, shardAddConcurrency)
+
 	return &ReconcilePerconaServerMongoDB{
 		client:                 client,
 		scheme:                 mgr.GetScheme(),
@@ -108,10 +116,54 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		newCertManagerCtrlFunc: tls.NewCertManagerController,
 		secretProviderHandler:  pkgSecret.NewProviderHandler(secretProviders...),
 
+		replsetConcurrency: replsetConcurrency,
+		shardAddSem:        make(chan struct{}, shardAddConcurrency),
+
 		initImage: initImage,
 
 		clientcmd: cli,
 	}, nil
+}
+
+const (
+	// envReplsetConcurrency bounds how many replsets of a single PerconaServerMongoDB
+	// are reconciled in parallel. Setting it to 1 restores fully sequential behavior.
+	envReplsetConcurrency = "REPLSET_RECONCILE_CONCURRENCY"
+	// envShardAddConcurrency bounds how many sh.addShard calls the operator issues at
+	// once. MongoDB serializes shard addition through the config server's DDL
+	// coordinator, so anything above a handful only produces lock contention.
+	envShardAddConcurrency = "SHARD_ADD_CONCURRENCY"
+
+	defaultReplsetConcurrency  = 8
+	defaultShardAddConcurrency = 1
+	maxShardAddConcurrency     = 3
+)
+
+// envIntOrDefault reads a positive integer from the environment, falling back to
+// def when unset or unparsable. The value is clamped to [minVal, maxVal];
+// maxVal <= 0 means unbounded.
+func envIntOrDefault(log logr.Logger, name string, def, minVal, maxVal int) int {
+	val := def
+
+	if s := os.Getenv(name); s != "" {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			log.Error(err, "invalid value, using default", "env", name, "value", s, "default", def)
+			return def
+		}
+		val = i
+	}
+
+	if val < minVal {
+		log.Info("value below minimum, clamping", "env", name, "value", val, "min", minVal)
+		val = minVal
+	}
+	if maxVal > 0 && val > maxVal {
+		log.Info("value above maximum, clamping", "env", name, "value", val, "max", maxVal)
+		val = maxVal
+	}
+
+	return val
 }
 
 func getOperatorPodImage(ctx context.Context) (string, error) {
@@ -207,6 +259,31 @@ type ReconcilePerconaServerMongoDB struct {
 	initImage string
 
 	lockers lockStore
+
+	// replsetConcurrency bounds how many replsets of a single CR are reconciled in
+	// parallel. Zero means "use defaultReplsetConcurrency"; see replsetLimit.
+	replsetConcurrency int
+
+	// shardAddSem bounds concurrent sh.addShard calls across every cluster this
+	// operator manages. A nil channel means shard addition is unbounded, so
+	// always acquire through withShardAddSlot.
+	shardAddSem chan struct{}
+
+	// crMu guards the few rare code paths that mutate the in-memory cr (or deep
+	// copy the whole object) from inside the concurrent replset region: storage
+	// autoscaling status updates and volume template reverts. See the audit
+	// comment above reconcileReplsets.
+	crMu sync.Mutex
+}
+
+// replsetLimit returns the effective per-CR replset concurrency. Reconcilers
+// built by tests may leave replsetConcurrency unset, in which case the default
+// applies.
+func (r *ReconcilePerconaServerMongoDB) replsetLimit() int {
+	if r.replsetConcurrency > 0 {
+		return r.replsetConcurrency
+	}
+	return defaultReplsetConcurrency
 }
 
 type lockStore struct {
