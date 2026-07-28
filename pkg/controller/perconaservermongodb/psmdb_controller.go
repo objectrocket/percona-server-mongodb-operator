@@ -769,51 +769,134 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplsets(ctx context.Context, c
 	}
 
 	clustersStart := time.Now()
-	defer func() {
-		logPhaseDuration(log, "replsetClusters", len(repls), clustersStart)
-	}()
+	clusterStatus, err := r.reconcileReplsetClusters(ctx, cr, repls, mongosPods.Items)
+	logPhaseDuration(log, "replsetClusters", len(repls), clustersStart)
 
-	var errs []error
-	clusterStatus := api.AppStateNone
-	for _, replset := range repls {
-		replsetStart := time.Now()
-		replsetStatus, members, err := r.reconcileCluster(ctx, cr, replset, mongosPods.Items)
+	return clusterStatus, err
+}
+
+// statusPriority orders replset states from most to least severe. The cluster
+// state is the most severe state of any replset.
+var statusPriority = []api.AppState{
+	api.AppStateError,
+	api.AppStateStopping,
+	api.AppStatePaused,
+	api.AppStateInit,
+	api.AppStateReady,
+}
+
+// replsetClusterResult pairs a replset with the outcome of its reconcileCluster
+// call. Workers fill in their own slot in a pre-sized slice, so the merge phase
+// can walk results in input order regardless of completion order.
+type replsetClusterResult struct {
+	name   string
+	result clusterReconcileResult
+	err    error
+}
+
+// reconcileReplsetClusters runs reconcileCluster for every replset, up to
+// r.replsetLimit() at a time, then merges the results into cr.Status serially.
+//
+// When sharding is enabled the config server replset is reconciled on its own
+// first, before any shard replset starts.
+//
+// Unlike the resource loop, this phase collects all errors instead of aborting on
+// the first one: workers stash their error in their own result slot and never
+// fail the group, and the merge phase joins them.
+func (r *ReconcilePerconaServerMongoDB) reconcileReplsetClusters(
+	ctx context.Context,
+	cr *api.PerconaServerMongoDB,
+	repls []*api.ReplsetSpec,
+	mongosPods []corev1.Pod,
+) (api.AppState, error) {
+	log := logf.FromContext(ctx)
+
+	reconcileOne := func(ctx context.Context, replset *api.ReplsetSpec) replsetClusterResult {
+		start := time.Now()
+		res, err := r.reconcileCluster(ctx, cr, replset, mongosPods)
 		log.V(1).Info("reconciled replset cluster",
 			"phase", "replsetClusters",
 			"replset", replset.Name,
-			"durationMs", time.Since(replsetStart).Milliseconds())
+			"durationMs", time.Since(start).Milliseconds())
 		if err != nil {
 			log.Error(err, "failed to reconcile cluster", "replset", replset.Name)
-			errs = append(errs, err)
+		}
+		return replsetClusterResult{name: replset.Name, result: res, err: err}
+	}
+
+	results := make([]replsetClusterResult, len(repls))
+
+	poolStart := 0
+	if cr.Spec.Sharding.Enabled && len(repls) > 0 && repls[0].ClusterRole == api.ClusterRoleConfigSvr {
+		results[0] = reconcileOne(ctx, repls[0])
+		poolStart = 1
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(r.replsetLimit())
+
+	for i := poolStart; i < len(repls); i++ {
+		g.Go(func() error {
+			results[i] = reconcileOne(ctx, repls[i])
+			return nil
+		})
+	}
+
+	// Workers never return an error, so this only waits for the pool to drain.
+	_ = g.Wait()
+
+	return mergeReplsetResults(log, cr, results)
+}
+
+// mergeReplsetResults applies the results of a replset reconcile pass to
+// cr.Status. It is the only place cr.Status is mutated for the cluster loop, and
+// it walks results in input order so the outcome does not depend on which
+// goroutine finished first.
+func mergeReplsetResults(log logr.Logger, cr *api.PerconaServerMongoDB, results []replsetClusterResult) (api.AppState, error) {
+	var errs []error
+	clusterStatus := api.AppStateNone
+
+	for _, res := range results {
+		if res.err != nil {
+			errs = append(errs, res.err)
 		}
 
-		switch replsetStatus {
+		switch res.result.state {
 		case api.AppStateInit, api.AppStateError:
-			log.V(1).Info("Replset status is not healthy", "replset", replset.Name, "status", replsetStatus)
+			log.V(1).Info("Replset status is not healthy", "replset", res.name, "status", res.result.state)
 		}
 
-		statusPriority := []api.AppState{
-			api.AppStateError,
-			api.AppStateStopping,
-			api.AppStatePaused,
-			api.AppStateInit,
-			api.AppStateReady,
-		}
 		for _, s := range statusPriority {
-			if replsetStatus == s || clusterStatus == s {
+			if res.result.state == s || clusterStatus == s {
 				clusterStatus = s
 				break
 			}
 		}
 
-		if rs, ok := cr.Status.Replsets[replset.Name]; ok {
-			rs.Members = make(map[string]api.ReplsetMemberStatus)
-			for pod, member := range members {
-				rs.Members[pod] = member
-			}
-			cr.Status.Replsets[replset.Name] = rs
+		for _, c := range res.result.conditions {
+			cr.Status.AddCondition(c)
 		}
+
+		rs, ok := cr.Status.Replsets[res.name]
+		if !ok {
+			continue
+		}
+
+		if res.result.setInitialized {
+			rs.Initialized = true
+		}
+		if res.result.addedAsShard != nil {
+			rs.AddedAsShard = res.result.addedAsShard
+		}
+
+		rs.Members = make(map[string]api.ReplsetMemberStatus, len(res.result.members))
+		for pod, member := range res.result.members {
+			rs.Members[pod] = member
+		}
+
+		cr.Status.Replsets[res.name] = rs
 	}
+
 	return clusterStatus, stderrors.Join(errs...)
 }
 

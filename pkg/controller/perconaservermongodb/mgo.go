@@ -32,27 +32,44 @@ import (
 
 var errReplsetLimit = fmt.Errorf("maximum replset member (%d) count reached", mongo.MaxMembers)
 
-func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, mongosPods []corev1.Pod) (api.AppState, map[string]api.ReplsetMemberStatus, error) {
+// clusterReconcileResult carries every cr.Status change reconcileCluster wants to
+// make. Replsets are reconciled concurrently, so reconcileCluster must not touch
+// cr itself: the caller applies these results serially in mergeReplsetResults.
+type clusterReconcileResult struct {
+	// state is the replset's app state, folded into the cluster state.
+	state api.AppState
+	// members replaces cr.Status.Replsets[rs].Members. A nil map still replaces
+	// the existing members with an empty map, matching the previous behavior.
+	members map[string]api.ReplsetMemberStatus
+	// setInitialized marks cr.Status.Replsets[rs].Initialized.
+	setInitialized bool
+	// addedAsShard, when non-nil, sets cr.Status.Replsets[rs].AddedAsShard.
+	addedAsShard *bool
+	// conditions are replayed through cr.Status.AddCondition in order.
+	conditions []api.ClusterCondition
+}
+
+func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, mongosPods []corev1.Pod) (clusterReconcileResult, error) {
 	log := logf.FromContext(ctx)
 
 	replsetSize := replset.GetSize()
 
 	restoreInProgress, err := r.restoreInProgress(ctx, cr, replset)
 	if err != nil {
-		return api.AppStateError, nil, errors.Wrap(err, "check if restore in progress")
+		return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "check if restore in progress")
 	}
 
 	if restoreInProgress {
-		return api.AppStateInit, nil, nil
+		return clusterReconcileResult{state: api.AppStateInit}, nil
 	}
 
 	if replsetSize == 0 {
-		return api.AppStateReady, nil, nil
+		return clusterReconcileResult{state: api.AppStateReady}, nil
 	}
 
 	pods, err := psmdb.GetRSPods(ctx, r.client, cr, replset.Name)
 	if err != nil {
-		return api.AppStateInit, nil, errors.Wrap(err, "failed to get replset pods")
+		return clusterReconcileResult{state: api.AppStateInit}, errors.Wrap(err, "failed to get replset pods")
 	}
 
 	// all pods needs to be scheduled to reconcile
@@ -60,33 +77,33 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		for _, pod := range pods.Items {
 			for _, containerStatus := range pod.Status.ContainerStatuses {
 				if containerStatus.State.Waiting != nil && containerStatus.State.Waiting.Reason == "CrashLoopBackOff" {
-					return api.AppStateError, nil, errors.Errorf("pod %s is in CrashLoopBackOff state", pod.Name)
+					return clusterReconcileResult{state: api.AppStateError}, errors.Errorf("pod %s is in CrashLoopBackOff state", pod.Name)
 				}
 			}
 		}
 		log.Info("Waiting for the pods", "replset", replset.Name, "size", replsetSize, "pods", len(pods.Items))
-		return api.AppStateInit, nil, nil
+		return clusterReconcileResult{state: api.AppStateInit}, nil
 	}
 
 	if cr.MCSEnabled() {
 		seList, err := psmdb.GetExportedServices(ctx, r.client, cr)
 		if err != nil {
-			return api.AppStateError, nil, errors.Wrap(err, "get exported services")
+			return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "get exported services")
 		}
 
 		if len(seList.Items) == 0 {
 			log.Info("waiting for service exports")
-			return api.AppStateInit, nil, nil
+			return clusterReconcileResult{state: api.AppStateInit}, nil
 		}
 
 		for _, se := range seList.Items {
 			imported, err := psmdb.IsServiceImported(ctx, r.client, cr, se.Name)
 			if err != nil {
-				return api.AppStateError, nil, errors.Wrapf(err, "check if service is imported for %s", se.Name)
+				return clusterReconcileResult{state: api.AppStateError}, errors.Wrapf(err, "check if service is imported for %s", se.Name)
 			}
 			if !imported {
 				log.Info("waiting for service import", "replset", replset.Name, "serviceExport", se.Name)
-				return api.AppStateInit, nil, nil
+				return clusterReconcileResult{state: api.AppStateInit}, nil
 			}
 		}
 	}
@@ -94,7 +111,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	cli, err := r.mongoClientWithRole(ctx, cr, replset, api.RoleClusterAdmin)
 	if err != nil {
 		if cr.Spec.Unmanaged {
-			return api.AppStateInit, nil, nil
+			return clusterReconcileResult{state: api.AppStateInit}, nil
 		}
 		if cr.Status.Replsets[replset.Name].Initialized {
 			if errors.Is(err, topology.ErrServerSelectionTimeout) && strings.Contains(err.Error(), "ReplicaSetNoPrimary") {
@@ -102,41 +119,39 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 
 				err := r.handleReplicaSetNoPrimary(ctx, cr, replset, pods.Items)
 				if err != nil {
-					return api.AppStateError, nil, errors.Wrap(err, "handle ReplicaSetNoPrimary")
+					return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "handle ReplicaSetNoPrimary")
 				}
 
-				return api.AppStateError, nil, nil
+				return clusterReconcileResult{state: api.AppStateError}, nil
 			}
 
-			return api.AppStateError, nil, errors.Wrap(err, "dial")
+			return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "dial")
 		}
 
 		pod, primary, err := r.handleReplsetInit(ctx, cr, replset, pods.Items)
 		if err != nil {
 			if errors.Is(err, errNoRunningMongodContainers) {
-				return api.AppStateInit, nil, nil
+				return clusterReconcileResult{state: api.AppStateInit}, nil
 			}
-			return api.AppStateInit, nil, errors.Wrap(err, "handleReplsetInit")
+			return clusterReconcileResult{state: api.AppStateInit}, errors.Wrap(err, "handleReplsetInit")
 		}
 
 		err = r.createOrUpdateSystemUsers(ctx, cr, replset)
 		if err != nil {
-			return api.AppStateInit, nil, errors.Wrap(err, "create system users")
+			return clusterReconcileResult{state: api.AppStateInit}, errors.Wrap(err, "create system users")
 		}
 
-		rs := cr.Status.Replsets[replset.Name]
-		rs.Initialized = true
-		rs.Members = map[string]api.ReplsetMemberStatus{pod.Name: *primary}
-		cr.Status.Replsets[replset.Name] = rs
-
-		cr.Status.AddCondition(api.ClusterCondition{
-			Status:             api.ConditionTrue,
-			Type:               api.AppStateInit,
-			Message:            replset.Name,
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		})
-
-		return api.AppStateInit, rs.Members, nil
+		return clusterReconcileResult{
+			state:          api.AppStateInit,
+			members:        map[string]api.ReplsetMemberStatus{pod.Name: *primary},
+			setInitialized: true,
+			conditions: []api.ClusterCondition{{
+				Status:             api.ConditionTrue,
+				Type:               api.AppStateInit,
+				Message:            replset.Name,
+				LastTransitionTime: metav1.NewTime(time.Now()),
+			}},
+		}, nil
 	}
 	defer func() {
 		if err := cli.Disconnect(ctx); err != nil {
@@ -147,38 +162,41 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	if cr.Spec.Unmanaged {
 		status, err := cli.RSStatus(ctx)
 		if err != nil {
-			return api.AppStateError, nil, errors.Wrap(err, "failed to get rs status")
+			return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "failed to get rs status")
 		}
 		if status.Primary() == nil {
-			return api.AppStateInit, nil, nil
+			return clusterReconcileResult{state: api.AppStateInit}, nil
 		}
-		return api.AppStateReady, nil, nil
+		return clusterReconcileResult{state: api.AppStateReady}, nil
 	}
 	err = r.createOrUpdateSystemUsers(ctx, cr, replset)
 	if err != nil {
-		return api.AppStateInit, nil, errors.Wrap(err, "create system users")
+		return clusterReconcileResult{state: api.AppStateInit}, errors.Wrap(err, "create system users")
 	}
 
 	// this can happen if cluster is initialized but status update failed
 	if !cr.Status.Replsets[replset.Name].Initialized {
-		rs := cr.Status.Replsets[replset.Name]
-		rs.Initialized = true
-		cr.Status.Replsets[replset.Name] = rs
-
-		cr.Status.AddCondition(api.ClusterCondition{
-			Status:             api.ConditionTrue,
-			Type:               api.AppStateInit,
-			Message:            replset.Name,
-			LastTransitionTime: metav1.NewTime(time.Now()),
-		})
-
-		return api.AppStateInit, nil, nil
+		return clusterReconcileResult{
+			state:          api.AppStateInit,
+			setInitialized: true,
+			conditions: []api.ClusterCondition{{
+				Status:             api.ConditionTrue,
+				Type:               api.AppStateInit,
+				Message:            replset.Name,
+				LastTransitionTime: metav1.NewTime(time.Now()),
+			}},
+		}, nil
 	}
 
 	rstRunning, err := r.isRestoreRunning(ctx, cr)
 	if err != nil {
-		return api.AppStateInit, nil, errors.Wrap(err, "failed to check running restore")
+		return clusterReconcileResult{state: api.AppStateInit}, errors.Wrap(err, "failed to check running restore")
 	}
+
+	// addedAsShard is applied by the merge phase even when a later step fails,
+	// matching the previous behavior where cr.Status was written in place as soon
+	// as the shard was known to be present.
+	var addedAsShard *bool
 
 	if cr.Spec.Sharding.Enabled &&
 		cr.Spec.Sharding.Mongos.Size > 0 &&
@@ -195,7 +213,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 
 			mongosSession, err := r.mongosClientWithRole(ctx, cr, api.RoleClusterAdmin)
 			if err != nil {
-				return api.AppStateError, nil, errors.Wrap(err, "failed to get mongos connection")
+				return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "failed to get mongos connection")
 			}
 
 			defer func() {
@@ -208,7 +226,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 			err = mongosSession.SetDefaultRWConcern(ctx, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
 			// SetDefaultRWConcern introduced in MongoDB 4.4
 			if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
-				return api.AppStateError, nil, errors.Wrap(err, "set default RW concern")
+				return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "set default RW concern")
 			}
 
 			rsName := replset.Name
@@ -219,23 +237,22 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 
 			in, err := inShard(ctx, mongosSession, rsName)
 			if err != nil {
-				return api.AppStateError, nil, errors.Wrap(err, "get shard")
+				return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "get shard")
 			}
 
 			if !in {
 				log.Info("adding rs to shard", "rs", rsName)
 				err := r.handleRsAddToShard(ctx, cr, replset, pods.Items[0], mongosPods[0])
 				if err != nil {
-					return api.AppStateError, nil, errors.Wrap(err, "add shard")
+					return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "add shard")
 				}
 
 				log.Info("added to shard", "rs", rsName)
 			}
 
-			rsStatus.AddedAsShard = ptr.To(true)
-			cr.Status.Replsets[replset.Name] = rsStatus
+			addedAsShard = ptr.To(true)
 		} else {
-			return api.AppStateInit, nil, nil
+			return clusterReconcileResult{state: api.AppStateInit}, nil
 		}
 	}
 
@@ -243,22 +260,22 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		err := cli.SetDefaultRWConcern(ctx, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
 		// SetDefaultRWConcern introduced in MongoDB 4.4
 		if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
-			return api.AppStateError, nil, errors.Wrap(err, "set default RW concern")
+			return clusterReconcileResult{state: api.AppStateError, addedAsShard: addedAsShard}, errors.Wrap(err, "set default RW concern")
 		}
 	}
 
 	rsMembers, liveMembers, err := r.updateConfigMembers(ctx, cli, cr, replset)
 	if err != nil {
-		return api.AppStateError, nil, errors.Wrap(err, "failed to update config members")
+		return clusterReconcileResult{state: api.AppStateError, addedAsShard: addedAsShard}, errors.Wrap(err, "failed to update config members")
 	}
 
 	if liveMembers == len(pods.Items) {
-		return api.AppStateReady, rsMembers, nil
+		return clusterReconcileResult{state: api.AppStateReady, members: rsMembers, addedAsShard: addedAsShard}, nil
 	}
 
 	log.V(1).Info("Replset is not ready", "liveMembers", liveMembers, "pods", len(pods.Items))
 
-	return api.AppStateInit, rsMembers, nil
+	return clusterReconcileResult{state: api.AppStateInit, members: rsMembers, addedAsShard: addedAsShard}, nil
 }
 
 func (r *ReconcilePerconaServerMongoDB) getConfigMemberForPod(ctx context.Context, cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec, id int, pod *corev1.Pod) (mongo.ConfigMember, error) {
