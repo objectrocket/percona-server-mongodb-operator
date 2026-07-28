@@ -242,8 +242,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 
 			if !in {
 				log.Info("adding rs to shard", "rs", rsName)
-				err := r.handleRsAddToShard(ctx, cr, replset, pods.Items[0], mongosPods[0])
-				if err != nil {
+				if err := r.addRsToShard(ctx, cr, replset, pods.Items[0], mongosPods[0]); err != nil {
 					return clusterReconcileResult{state: api.AppStateError}, errors.Wrap(err, "add shard")
 				}
 
@@ -619,6 +618,75 @@ func (r *ReconcilePerconaServerMongoDB) removeRSFromShard(ctx context.Context, c
 
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// shardDDLLockErrors are the MongoDB errors returned when addShard collides with
+// another DDL operation on the config server's coordinator.
+var shardDDLLockErrors = []string{
+	"LockBusy",
+	"ConflictingOperationInProgress",
+}
+
+// isShardDDLLockError reports whether err is a retriable shard DDL lock error.
+func isShardDDLLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := err.Error()
+	for _, e := range shardDDLLockErrors {
+		if strings.Contains(msg, e) {
+			return true
+		}
+	}
+
+	return false
+}
+
+var shardAddBackoff = wait.Backoff{
+	Steps:    5,
+	Duration: 2 * time.Second,
+	Factor:   1.5,
+	Jitter:   0.1,
+}
+
+// withShardAddSlot runs f while holding a slot in the shard-add semaphore. The
+// semaphore is reconciler-wide (not per-CR) because the config server DDL
+// coordinator is shared by every shard of a cluster and the operator may manage
+// several clusters at once. A nil semaphore means no gating, which keeps
+// reconcilers built by tests working.
+func (r *ReconcilePerconaServerMongoDB) withShardAddSlot(ctx context.Context, f func() error) error {
+	if r.shardAddSem == nil {
+		return f()
+	}
+
+	select {
+	case r.shardAddSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-r.shardAddSem }()
+
+	return f()
+}
+
+// addRsToShard adds a replset to the sharded cluster, serialized through the
+// shard-add semaphore and retried on shard DDL lock contention.
+func (r *ReconcilePerconaServerMongoDB) addRsToShard(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, rspod, mongosPod corev1.Pod) error {
+	log := logf.FromContext(ctx)
+
+	return r.withShardAddSlot(ctx, func() error {
+		attempt := 0
+		return retry.OnError(shardAddBackoff, isShardDDLLockError, func() error {
+			attempt++
+			err := r.handleRsAddToShard(ctx, cr, replset, rspod, mongosPod)
+			if err != nil && isShardDDLLockError(err) {
+				log.Info("addShard hit a DDL lock, retrying",
+					"replset", replset.Name, "attempt", attempt, "error", err.Error())
+			}
+			return err
+		})
+	})
 }
 
 func (r *ReconcilePerconaServerMongoDB) handleRsAddToShard(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, rspod corev1.Pod,
