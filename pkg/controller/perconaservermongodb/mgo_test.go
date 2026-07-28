@@ -1,9 +1,14 @@
 package perconaservermongodb
 
 import (
+	"context"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
@@ -185,4 +190,123 @@ func TestCompareRoles(t *testing.T) {
 			assert.Equal(t, tt.expected, actual)
 		})
 	}
+}
+
+func TestIsShardDDLLockError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "unrelated error",
+			err:      errors.New("connection refused"),
+			expected: false,
+		},
+		{
+			name:     "LockBusy",
+			err:      errors.New("(LockBusy) Unable to acquire DDL lock for namespace"),
+			expected: true,
+		},
+		{
+			name:     "ConflictingOperationInProgress",
+			err:      errors.New("(ConflictingOperationInProgress) another operation is in progress"),
+			expected: true,
+		},
+		{
+			name:     "wrapped LockBusy",
+			err:      errors.Wrap(errors.New("(LockBusy) lock held"), "add shard"),
+			expected: true,
+		},
+		{
+			name:     "CommandNotFound is not retriable",
+			err:      errors.New("(CommandNotFound) no such command"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.expected, isShardDDLLockError(tt.err))
+		})
+	}
+}
+
+// TestWithShardAddSlot checks that the shard-add gate admits at most
+// cap(shardAddSem) callers at a time and honors context cancellation.
+func TestWithShardAddSlot(t *testing.T) {
+	t.Parallel()
+
+	t.Run("nil semaphore does not gate", func(t *testing.T) {
+		r := &ReconcilePerconaServerMongoDB{}
+
+		called := false
+		require.NoError(t, r.withShardAddSlot(context.Background(), func() error {
+			called = true
+			return nil
+		}))
+		assert.True(t, called)
+	})
+
+	t.Run("bounds concurrency", func(t *testing.T) {
+		const limit = 2
+		r := &ReconcilePerconaServerMongoDB{shardAddSem: make(chan struct{}, limit)}
+
+		var (
+			mu      sync.Mutex
+			inside  int
+			maxSeen int
+		)
+
+		var wg sync.WaitGroup
+		for range 20 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = r.withShardAddSlot(context.Background(), func() error {
+					mu.Lock()
+					inside++
+					if inside > maxSeen {
+						maxSeen = inside
+					}
+					mu.Unlock()
+
+					time.Sleep(time.Millisecond)
+
+					mu.Lock()
+					inside--
+					mu.Unlock()
+
+					return nil
+				})
+			}()
+		}
+		wg.Wait()
+
+		assert.LessOrEqual(t, maxSeen, limit)
+	})
+
+	t.Run("honors cancellation", func(t *testing.T) {
+		r := &ReconcilePerconaServerMongoDB{shardAddSem: make(chan struct{}, 1)}
+		// Occupy the only slot so the next acquisition has to wait.
+		r.shardAddSem <- struct{}{}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		called := false
+		err := r.withShardAddSlot(ctx, func() error {
+			called = true
+			return nil
+		})
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.False(t, called)
+	})
 }
