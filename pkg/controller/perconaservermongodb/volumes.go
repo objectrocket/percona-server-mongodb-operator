@@ -310,6 +310,11 @@ func (r *ReconcilePerconaServerMongoDB) handlePVCResizeFailure(ctx context.Conte
 func (r *ReconcilePerconaServerMongoDB) revertVolumeTemplate(ctx context.Context, cr *psmdbv1.PerconaServerMongoDB, sts *appsv1.StatefulSet, originalSize resource.Quantity) error {
 	log := logf.FromContext(ctx)
 
+	// cr is shared between concurrently reconciled replsets: guard both the spec
+	// mutation and the deep copies taken around it.
+	r.crMu.Lock()
+	defer r.crMu.Unlock()
+
 	orig := cr.DeepCopy()
 
 	replset, ok := sts.Labels[naming.LabelKubernetesReplset]

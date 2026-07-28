@@ -199,6 +199,11 @@ func (r *ReconcilePerconaServerMongoDB) triggerResize(
 ) error {
 	log := logf.FromContext(ctx).WithName("StorageAutoscaling").WithValues("pvc", pvc.Name)
 
+	// cr is shared between concurrently reconciled replsets: guard both the spec
+	// mutation and the deep copies taken around it.
+	r.crMu.Lock()
+	defer r.crMu.Unlock()
+
 	orig := cr.DeepCopy()
 
 	volumeSpec.PersistentVolumeClaim.Resources.Requests[corev1.ResourceStorage] = newSize
@@ -228,6 +233,11 @@ func (r *ReconcilePerconaServerMongoDB) updateAutoscalingStatus(
 		log.V(1).Info("no pvc name specified")
 		return
 	}
+
+	// Replsets are reconciled concurrently and all of them share cr, so this map
+	// must not be written without holding crMu.
+	r.crMu.Lock()
+	defer r.crMu.Unlock()
 
 	if cr.Status.StorageAutoscaling == nil {
 		cr.Status.StorageAutoscaling = make(map[string]api.StorageAutoscalingStatus)
