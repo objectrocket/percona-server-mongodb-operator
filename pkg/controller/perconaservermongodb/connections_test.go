@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,7 +156,7 @@ func TestConnectionLeaks(t *testing.T) {
 				})
 			}
 
-			connectionCount := new(int)
+			connectionCount := new(atomic.Int64)
 
 			r := buildFakeClient(obj...)
 			r.mongoClientProvider = &fakeMongoClientProvider{pods: rsPods, cr: cr, connectionCount: connectionCount}
@@ -175,8 +176,8 @@ func TestConnectionLeaks(t *testing.T) {
 						Name:      cr.Name,
 					},
 				})
-				if *connectionCount != 0 {
-					return errors.Errorf("open connections: %d", *connectionCount)
+				if connectionCount.Load() != 0 {
+					return errors.Errorf("open connections: %d", connectionCount.Load())
 				}
 				if err != nil {
 					return err
@@ -189,8 +190,8 @@ func TestConnectionLeaks(t *testing.T) {
 						Name:      cr.Name,
 					},
 				})
-				if *connectionCount != 0 {
-					return errors.Errorf("open connections: %d", *connectionCount)
+				if connectionCount.Load() != 0 {
+					return errors.Errorf("open connections: %d", connectionCount.Load())
 				}
 				if err != nil {
 					return err
@@ -207,8 +208,8 @@ func TestConnectionLeaks(t *testing.T) {
 						Name:      cr.Name,
 					},
 				})
-				if *connectionCount != 0 {
-					return errors.Errorf("open connections: %d", *connectionCount)
+				if connectionCount.Load() != 0 {
+					return errors.Errorf("open connections: %d", connectionCount.Load())
 				}
 				return err
 			},
@@ -381,25 +382,25 @@ func fakeStatefulset(cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec, size int
 type fakeMongoClientProvider struct {
 	pods            []client.Object
 	cr              *api.PerconaServerMongoDB
-	connectionCount *int
+	connectionCount *atomic.Int64
 }
 
 func (g *fakeMongoClientProvider) Mongo(ctx context.Context, cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec, role api.SystemUserRole) (mongo.Client, error) {
-	*g.connectionCount++
+	g.connectionCount.Add(1)
 
 	fakeClient := mongoFake.NewClient()
 	return &fakeMongoClient{pods: g.pods, cr: g.cr, connectionCount: g.connectionCount, Client: fakeClient}, nil
 }
 
 func (g *fakeMongoClientProvider) Mongos(ctx context.Context, cr *api.PerconaServerMongoDB, role api.SystemUserRole) (mongo.Client, error) {
-	*g.connectionCount++
+	g.connectionCount.Add(1)
 
 	fakeClient := mongoFake.NewClient()
 	return &fakeMongoClient{pods: g.pods, cr: g.cr, connectionCount: g.connectionCount, Client: fakeClient}, nil
 }
 
 func (g *fakeMongoClientProvider) Standalone(ctx context.Context, cr *api.PerconaServerMongoDB, role api.SystemUserRole, host string, tlsEnabled bool) (mongo.Client, error) {
-	*g.connectionCount++
+	g.connectionCount.Add(1)
 
 	fakeClient := mongoFake.NewClient()
 	return &fakeMongoClient{pods: g.pods, cr: g.cr, connectionCount: g.connectionCount, Client: fakeClient, host: host}, nil
@@ -408,13 +409,13 @@ func (g *fakeMongoClientProvider) Standalone(ctx context.Context, cr *api.Percon
 type fakeMongoClient struct {
 	pods            []client.Object
 	cr              *api.PerconaServerMongoDB
-	connectionCount *int
+	connectionCount *atomic.Int64
 	host            string
 	mongo.Client
 }
 
 func (c *fakeMongoClient) Disconnect(ctx context.Context) error {
-	*c.connectionCount--
+	c.connectionCount.Add(-1)
 	return nil
 }
 
