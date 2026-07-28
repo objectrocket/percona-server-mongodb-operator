@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	v "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
@@ -557,37 +558,66 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplset(ctx context.Context, cr
 	return nil
 }
 
+// logPhaseDuration emits a single duration measurement for a reconcile phase.
+// Phase names are stable so they can be aggregated in log queries:
+// "services", "replsetSpecs" (loop 1) and "replsetClusters" (loop 2).
+func logPhaseDuration(log logr.Logger, phase string, replsetCount int, start time.Time) {
+	log.Info("reconcile phase finished",
+		"phase", phase,
+		"replsetCount", replsetCount,
+		"durationMs", time.Since(start).Milliseconds())
+}
+
 func (r *ReconcilePerconaServerMongoDB) reconcileReplsets(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) (api.AppState, error) {
 	log := logf.FromContext(ctx)
 
+	servicesStart := time.Now()
 	if err := r.reconcileServices(ctx, cr, repls); err != nil {
 		return "", errors.Wrap(err, "reconcile services")
 	}
+	logPhaseDuration(log, "services", len(repls), servicesStart)
 
+	specsStart := time.Now()
 	for _, replset := range repls {
 		if cr.Spec.Sharding.Enabled && replset.ClusterRole != api.ClusterRoleConfigSvr && replset.Name == api.ConfigReplSetName {
 			return "", errors.Errorf("%s is reserved name for config server replset", api.ConfigReplSetName)
 		}
 
+		replsetStart := time.Now()
 		if err := r.reconcileReplset(ctx, cr, replset); err != nil {
 			return "", errors.Wrapf(err, "reconcile replset %s", replset.Name)
 		}
+		log.V(1).Info("reconciled replset resources",
+			"phase", "replsetSpecs",
+			"replset", replset.Name,
+			"durationMs", time.Since(replsetStart).Milliseconds())
 
 		// TODO: why do we do it for each replset??
 		if err := r.fetchVersionFromMongo(ctx, cr, replset); err != nil {
 			return "", errors.Wrap(err, "update mongo version")
 		}
 	}
+	logPhaseDuration(log, "replsetSpecs", len(repls), specsStart)
 
 	mongosPods, err := r.getMongosPods(ctx, cr)
 	if err != nil && !k8serrors.IsNotFound(err) {
 		return "", errors.Wrap(err, "get pods list for mongos")
 	}
 
+	clustersStart := time.Now()
+	defer func() {
+		logPhaseDuration(log, "replsetClusters", len(repls), clustersStart)
+	}()
+
 	var errs []error
 	clusterStatus := api.AppStateNone
 	for _, replset := range repls {
+		replsetStart := time.Now()
 		replsetStatus, members, err := r.reconcileCluster(ctx, cr, replset, mongosPods.Items)
+		log.V(1).Info("reconciled replset cluster",
+			"phase", "replsetClusters",
+			"replset", replset.Name,
+			"durationMs", time.Since(replsetStart).Milliseconds())
 		if err != nil {
 			log.Error(err, "failed to reconcile cluster", "replset", replset.Name)
 			errs = append(errs, err)
