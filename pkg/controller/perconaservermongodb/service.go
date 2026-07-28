@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
@@ -27,31 +28,47 @@ func (r *ReconcilePerconaServerMongoDB) reconcileServices(ctx context.Context, c
 	return nil
 }
 
+// reconcileReplsetServices reconciles the Services of every replset, up to
+// r.replsetLimit() at a time. Nothing in this path touches cr, so the replsets
+// are independent; the first error wins and cancels the group, as it did when
+// this loop was sequential.
 func (r *ReconcilePerconaServerMongoDB) reconcileReplsetServices(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) error {
+	g, gCtx := errgroup.WithContext(ctx)
+	g.SetLimit(r.replsetLimit())
+
 	for _, rs := range repls {
-		// Create headless service
-		service := psmdb.Service(cr, rs)
-		if err := setControllerReference(cr, service, r.scheme); err != nil {
-			return errors.Wrapf(err, "set owner ref for service %s", service.Name)
-		}
-		if err := r.createOrUpdateSvc(ctx, cr, service, true); err != nil {
-			return errors.Wrapf(err, "create or update service for replset %s", rs.Name)
-		}
-		if err := r.removeOutdatedServices(ctx, cr, rs); err != nil {
-			return errors.Wrapf(err, "failed to remove old services of replset %s", rs.Name)
-		}
-		if !rs.Expose.Enabled {
-			continue
-		}
-		// Create exposed services
-		pods, err := psmdb.GetRSPods(ctx, r.client, cr, rs.Name)
-		if err != nil {
-			return errors.Wrapf(err, "get pods list for replset %s", rs.Name)
-		}
-		if err := r.ensureExternalServices(ctx, cr, rs, &pods); err != nil {
-			return errors.Wrap(err, "ensure external services")
-		}
+		g.Go(func() error {
+			return r.reconcileReplsetService(gCtx, cr, rs)
+		})
 	}
+
+	return g.Wait()
+}
+
+func (r *ReconcilePerconaServerMongoDB) reconcileReplsetService(ctx context.Context, cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec) error {
+	// Create headless service
+	service := psmdb.Service(cr, rs)
+	if err := setControllerReference(cr, service, r.scheme); err != nil {
+		return errors.Wrapf(err, "set owner ref for service %s", service.Name)
+	}
+	if err := r.createOrUpdateSvc(ctx, cr, service, true); err != nil {
+		return errors.Wrapf(err, "create or update service for replset %s", rs.Name)
+	}
+	if err := r.removeOutdatedServices(ctx, cr, rs); err != nil {
+		return errors.Wrapf(err, "failed to remove old services of replset %s", rs.Name)
+	}
+	if !rs.Expose.Enabled {
+		return nil
+	}
+	// Create exposed services
+	pods, err := psmdb.GetRSPods(ctx, r.client, cr, rs.Name)
+	if err != nil {
+		return errors.Wrapf(err, "get pods list for replset %s", rs.Name)
+	}
+	if err := r.ensureExternalServices(ctx, cr, rs, &pods); err != nil {
+		return errors.Wrap(err, "ensure external services")
+	}
+
 	return nil
 }
 
