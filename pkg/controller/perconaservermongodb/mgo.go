@@ -650,22 +650,30 @@ var shardAddBackoff = wait.Backoff{
 	Jitter:   0.1,
 }
 
-// withShardAddSlot runs f while holding a slot in the shard-add semaphore. The
-// semaphore is reconciler-wide (not per-CR) because the config server DDL
-// coordinator is shared by every shard of a cluster and the operator may manage
-// several clusters at once. A nil semaphore means no gating, which keeps
-// reconcilers built by tests working.
-func (r *ReconcilePerconaServerMongoDB) withShardAddSlot(ctx context.Context, f func() error) error {
-	if r.shardAddSem == nil {
+// withShardAddSlot runs f while holding a slot in the per-cluster shard-add
+// semaphore. The semaphore is scoped per CR (namespace/name) because each
+// cluster has its own config-server DDL coordinator. A nil shardAddSems map
+// means no gating, which keeps reconcilers built by tests working (unbounded).
+func (r *ReconcilePerconaServerMongoDB) withShardAddSlot(ctx context.Context, cr *api.PerconaServerMongoDB, f func() error) error {
+	if r.shardAddSems == nil {
 		return f()
 	}
 
+	key := cr.Namespace + "/" + cr.Name
+	cap := r.shardAddCap
+	if cap < 1 {
+		cap = defaultShardAddConcurrency
+	}
+
+	val, _ := r.shardAddSems.LoadOrStore(key, make(chan struct{}, cap))
+	sem := val.(chan struct{})
+
 	select {
-	case r.shardAddSem <- struct{}{}:
+	case sem <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	defer func() { <-r.shardAddSem }()
+	defer func() { <-sem }()
 
 	return f()
 }
@@ -675,7 +683,7 @@ func (r *ReconcilePerconaServerMongoDB) withShardAddSlot(ctx context.Context, f 
 func (r *ReconcilePerconaServerMongoDB) addRsToShard(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, rspod, mongosPod corev1.Pod) error {
 	log := logf.FromContext(ctx)
 
-	return r.withShardAddSlot(ctx, func() error {
+	return r.withShardAddSlot(ctx, cr, func() error {
 		attempt := 0
 		return retry.OnError(shardAddBackoff, isShardDDLLockError, func() error {
 			attempt++
