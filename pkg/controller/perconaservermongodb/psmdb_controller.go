@@ -118,7 +118,8 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		secretProviderHandler:  pkgSecret.NewProviderHandler(secretProviders...),
 
 		replsetConcurrency: replsetConcurrency,
-		shardAddSem:        make(chan struct{}, shardAddConcurrency),
+		shardAddSems:       new(sync.Map),
+		shardAddCap:        shardAddConcurrency,
 
 		initImage: initImage,
 
@@ -265,16 +266,13 @@ type ReconcilePerconaServerMongoDB struct {
 	// parallel. Zero means "use defaultReplsetConcurrency"; see replsetLimit.
 	replsetConcurrency int
 
-	// shardAddSem bounds concurrent sh.addShard calls across every cluster this
-	// operator manages. A nil channel means shard addition is unbounded, so
-	// always acquire through withShardAddSlot.
-	shardAddSem chan struct{}
-
-	// crMu guards the few rare code paths that mutate the in-memory cr (or deep
-	// copy the whole object) from inside the concurrent replset region: storage
-	// autoscaling status updates and volume template reverts. See the audit
-	// comment above reconcileReplsets.
-	crMu sync.Mutex
+	// shardAddSems is a per-cluster registry of shard-add semaphores, keyed by
+	// namespace/name. Each cluster has its own config-server DDL coordinator, so
+	// one cluster's addShard must not block another's. Created lazily via
+	// LoadOrStore. A nil map means shard addition is unbounded (tests).
+	shardAddSems *sync.Map
+	// shardAddCap is the capacity for each per-cluster semaphore channel.
+	shardAddCap int
 }
 
 // replsetLimit returns the effective per-CR replset concurrency. Reconcilers
@@ -650,8 +648,17 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplset(ctx context.Context, cr
 // in flight run to completion or unwind, so up to replsetLimit()-1 additional
 // replsets may be reconciled before the abort takes effect. The work is
 // idempotent, so this is a change in ordering only.
+//
+// A crMutationQueue is installed in the context so that code paths which need to
+// mutate the shared CR (triggerResize, updateAutoscalingStatus,
+// handlePVCResizeFailure) enqueue their writes instead of racing. The queue is
+// drained serially after the pool completes.
 func (r *ReconcilePerconaServerMongoDB) reconcileReplsetSpecs(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) error {
 	log := logf.FromContext(ctx)
+
+	// Install the mutation queue so workers defer CR writes.
+	mq := &crMutationQueue{}
+	mqCtx := withCRMutationQueue(ctx, mq)
 
 	reconcileOne := func(ctx context.Context, replset *api.ReplsetSpec) error {
 		start := time.Now()
@@ -667,13 +674,13 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplsetSpecs(ctx context.Contex
 	}
 
 	if cr.Spec.Sharding.Enabled && len(repls) > 0 && repls[0].ClusterRole == api.ClusterRoleConfigSvr {
-		if err := reconcileOne(ctx, repls[0]); err != nil {
+		if err := reconcileOne(mqCtx, repls[0]); err != nil {
 			return err
 		}
 		repls = repls[1:]
 	}
 
-	g, gCtx := errgroup.WithContext(ctx)
+	g, gCtx := errgroup.WithContext(mqCtx)
 	g.SetLimit(r.replsetLimit())
 
 	for _, replset := range repls {
@@ -682,7 +689,14 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplsetSpecs(ctx context.Contex
 		})
 	}
 
-	return g.Wait()
+	poolErr := g.Wait()
+
+	// Drain deferred CR mutations even when the pool returned an error, so that
+	// queued reverts are not dropped. But make sure a drain error does not mask
+	// the original pool error (pool error reported first).
+	drainErr := mq.Drain(ctx)
+
+	return stderrors.Join(poolErr, drainErr)
 }
 
 // logPhaseDuration emits a single duration measurement for a reconcile phase.
@@ -712,10 +726,11 @@ func logPhaseDuration(log logr.Logger, phase string, replsetCount int, start tim
 //   - version.go fetchVersionFromMongo: writes cr.Status and calls
 //     Status().Update. Hoisted out of the pool and run once per reconcile.
 //   - volume_autoscaling.go updateAutoscalingStatus / triggerResize and
-//     volumes.go revertVolumeTemplate: mutate cr (and deep copy the whole
-//     object) on the storage autoscaling / PVC resize failure paths. Those are
-//     per-replset writes plus a whole-cr DeepCopy, so they are serialized with
-//     r.crMu rather than being threaded through the merge phase.
+//     volumes.go handlePVCResizeFailure (revertVolumeTemplate +
+//     k8s.DeannotateObject): deferred to the post-pool drain phase via the ctx
+//     mutation queue (crMutationQueue). When no queue is present in the context
+//     (non-pool callers, e.g. mongos reconciliation or unit tests), mutations
+//     apply immediately and inline so behavior is unchanged.
 //
 // Verified writer-free: statefulset.go (reconcileStatefulSet, reconcilePVCs,
 // reconcilePDB, createOrUpdate), smart.go (smartUpdate only reads
@@ -724,7 +739,7 @@ func logPhaseDuration(log logr.Logger, phase string, replsetCount int, start tim
 // handleReplicaSetNoPrimary).
 //
 // Any new writer must either be refactored to return values that the merge
-// phase applies, or take r.crMu.
+// phase applies, or enqueue to the ctx mutation queue.
 func (r *ReconcilePerconaServerMongoDB) reconcileReplsets(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) (api.AppState, error) {
 	log := logf.FromContext(ctx)
 

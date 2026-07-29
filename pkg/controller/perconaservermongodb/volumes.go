@@ -296,24 +296,29 @@ func (r *ReconcilePerconaServerMongoDB) resizeVolumesIfNeeded(ctx context.Contex
 }
 
 func (r *ReconcilePerconaServerMongoDB) handlePVCResizeFailure(ctx context.Context, cr *psmdbv1.PerconaServerMongoDB, sts *appsv1.StatefulSet, originalSize resource.Quantity) error {
-	if err := r.revertVolumeTemplate(ctx, cr, sts, originalSize); err != nil {
-		return errors.Wrapf(err, "revert volume template for sts/%s", sts.Name)
+	mutationName := "handlePVCResizeFailure/" + sts.Name
+	applyFn := func(ctx context.Context) error {
+		if err := r.revertVolumeTemplate(ctx, cr, sts, originalSize); err != nil {
+			return errors.Wrapf(err, "revert volume template for sts/%s", sts.Name)
+		}
+
+		if err := k8s.DeannotateObject(ctx, r.client, sts, psmdbv1.AnnotationPVCResizeInProgress); err != nil {
+			return errors.Wrapf(err, "deannotate psmdb/%s", cr.Name)
+		}
+
+		return nil
 	}
 
-	if err := k8s.DeannotateObject(ctx, r.client, sts, psmdbv1.AnnotationPVCResizeInProgress); err != nil {
-		return errors.Wrapf(err, "deannotate psmdb/%s", cr.Name)
+	if q := crMutationQueueFrom(ctx); q != nil {
+		q.Enqueue(crMutation{name: mutationName, apply: applyFn})
+		return nil
 	}
 
-	return nil
+	return applyFn(ctx)
 }
 
 func (r *ReconcilePerconaServerMongoDB) revertVolumeTemplate(ctx context.Context, cr *psmdbv1.PerconaServerMongoDB, sts *appsv1.StatefulSet, originalSize resource.Quantity) error {
 	log := logf.FromContext(ctx)
-
-	// cr is shared between concurrently reconciled replsets: guard both the spec
-	// mutation and the deep copies taken around it.
-	r.crMu.Lock()
-	defer r.crMu.Unlock()
 
 	orig := cr.DeepCopy()
 
