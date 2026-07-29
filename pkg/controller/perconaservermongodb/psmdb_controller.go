@@ -8,14 +8,17 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/go-logr/logr"
 	v "github.com/hashicorp/go-version"
 	"github.com/pkg/errors"
 	"github.com/robfig/cron/v3"
+	"golang.org/x/sync/errgroup"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -95,6 +98,13 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		new(vault.Provider),
 	}
 
+	replsetConcurrency := envIntOrDefault(mgr.GetLogger(), envReplsetConcurrency, defaultReplsetConcurrency, 1, 0)
+	shardAddConcurrency := envIntOrDefault(mgr.GetLogger(), envShardAddConcurrency, defaultShardAddConcurrency, 1, maxShardAddConcurrency)
+
+	mgr.GetLogger().Info("replset reconcile concurrency",
+		envReplsetConcurrency, replsetConcurrency,
+		envShardAddConcurrency, shardAddConcurrency)
+
 	return &ReconcilePerconaServerMongoDB{
 		client:                 client,
 		scheme:                 mgr.GetScheme(),
@@ -107,10 +117,55 @@ func newReconciler(mgr manager.Manager) (reconcile.Reconciler, error) {
 		newCertManagerCtrlFunc: tls.NewCertManagerController,
 		secretProviderHandler:  pkgSecret.NewProviderHandler(secretProviders...),
 
+		replsetConcurrency: replsetConcurrency,
+		shardAddSems:       new(sync.Map),
+		shardAddCap:        shardAddConcurrency,
+
 		initImage: initImage,
 
 		clientcmd: cli,
 	}, nil
+}
+
+const (
+	// envReplsetConcurrency bounds how many replsets of a single PerconaServerMongoDB
+	// are reconciled in parallel. Setting it to 1 restores fully sequential behavior.
+	envReplsetConcurrency = "REPLSET_RECONCILE_CONCURRENCY"
+	// envShardAddConcurrency bounds how many sh.addShard calls the operator issues at
+	// once. MongoDB serializes shard addition through the config server's DDL
+	// coordinator, so anything above a handful only produces lock contention.
+	envShardAddConcurrency = "SHARD_ADD_CONCURRENCY"
+
+	defaultReplsetConcurrency  = 8
+	defaultShardAddConcurrency = 1
+	maxShardAddConcurrency     = 3
+)
+
+// envIntOrDefault reads a positive integer from the environment, falling back to
+// def when unset or unparsable. The value is clamped to [minVal, maxVal];
+// maxVal <= 0 means unbounded.
+func envIntOrDefault(log logr.Logger, name string, def, minVal, maxVal int) int {
+	val := def
+
+	if s := os.Getenv(name); s != "" {
+		i, err := strconv.Atoi(s)
+		if err != nil {
+			log.Error(err, "invalid value, using default", "env", name, "value", s, "default", def)
+			return def
+		}
+		val = i
+	}
+
+	if val < minVal {
+		log.Info("value below minimum, clamping", "env", name, "value", val, "min", minVal)
+		val = minVal
+	}
+	if maxVal > 0 && val > maxVal {
+		log.Info("value above maximum, clamping", "env", name, "value", val, "max", maxVal)
+		val = maxVal
+	}
+
+	return val
 }
 
 func getOperatorPodImage(ctx context.Context) (string, error) {
@@ -206,6 +261,28 @@ type ReconcilePerconaServerMongoDB struct {
 	initImage string
 
 	lockers lockStore
+
+	// replsetConcurrency bounds how many replsets of a single CR are reconciled in
+	// parallel. Zero means "use defaultReplsetConcurrency"; see replsetLimit.
+	replsetConcurrency int
+
+	// shardAddSems is a per-cluster registry of shard-add semaphores, keyed by
+	// namespace/name. Each cluster has its own config-server DDL coordinator, so
+	// one cluster's addShard must not block another's. Created lazily via
+	// LoadOrStore. A nil map means shard addition is unbounded (tests).
+	shardAddSems *sync.Map
+	// shardAddCap is the capacity for each per-cluster semaphore channel.
+	shardAddCap int
+}
+
+// replsetLimit returns the effective per-CR replset concurrency. Reconcilers
+// built by tests may leave replsetConcurrency unset, in which case the default
+// applies.
+func (r *ReconcilePerconaServerMongoDB) replsetLimit() int {
+	if r.replsetConcurrency > 0 {
+		return r.replsetConcurrency
+	}
+	return defaultReplsetConcurrency
 }
 
 type lockStore struct {
@@ -551,30 +628,152 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplset(ctx context.Context, cr
 
 	_, ok := cr.Status.Replsets[replset.Name]
 	if !ok {
-		cr.Status.Replsets[replset.Name] = api.ReplsetStatus{}
+		// Status entries are pre-created serially by reconcileReplsets: this
+		// function runs inside a worker pool and must not write to cr.
+		return errors.Errorf("missing status entry for replset %s", replset.Name)
 	}
 
 	return nil
 }
 
+// reconcileReplsetSpecs reconciles the Kubernetes resources (StatefulSets, PVCs,
+// PDBs) of every replset, up to r.replsetLimit() at a time.
+//
+// When sharding is enabled the config server replset is reconciled on its own
+// first: it is guaranteed to be repls[0] (see the caller of reconcileReplsets)
+// and it gates mongos creation, so it must not race with the shards.
+//
+// The sequential loop this replaces aborted on the first error. With a pool the
+// first error cancels the group context and is returned, but goroutines already
+// in flight run to completion or unwind, so up to replsetLimit()-1 additional
+// replsets may be reconciled before the abort takes effect. The work is
+// idempotent, so this is a change in ordering only.
+//
+// A crMutationQueue is installed in the context so that code paths which need to
+// mutate the shared CR (triggerResize, updateAutoscalingStatus,
+// handlePVCResizeFailure) enqueue their writes instead of racing. The queue is
+// drained serially after the pool completes.
+func (r *ReconcilePerconaServerMongoDB) reconcileReplsetSpecs(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) error {
+	log := logf.FromContext(ctx)
+
+	// Install the mutation queue so workers defer CR writes.
+	mq := &crMutationQueue{}
+	mqCtx := withCRMutationQueue(ctx, mq)
+
+	reconcileOne := func(ctx context.Context, replset *api.ReplsetSpec) error {
+		start := time.Now()
+		err := r.reconcileReplset(ctx, cr, replset)
+		log.V(1).Info("reconciled replset resources",
+			"phase", "replsetSpecs",
+			"replset", replset.Name,
+			"durationMs", time.Since(start).Milliseconds())
+		if err != nil {
+			return errors.Wrapf(err, "reconcile replset %s", replset.Name)
+		}
+		return nil
+	}
+
+	if cr.Spec.Sharding.Enabled && len(repls) > 0 && repls[0].ClusterRole == api.ClusterRoleConfigSvr {
+		if err := reconcileOne(mqCtx, repls[0]); err != nil {
+			return err
+		}
+		repls = repls[1:]
+	}
+
+	g, gCtx := errgroup.WithContext(mqCtx)
+	g.SetLimit(r.replsetLimit())
+
+	for _, replset := range repls {
+		g.Go(func() error {
+			return reconcileOne(gCtx, replset)
+		})
+	}
+
+	poolErr := g.Wait()
+
+	// Drain deferred CR mutations even when the pool returned an error, so that
+	// queued reverts are not dropped. But make sure a drain error does not mask
+	// the original pool error (pool error reported first).
+	drainErr := mq.Drain(ctx)
+
+	return stderrors.Join(poolErr, drainErr)
+}
+
+// logPhaseDuration emits a single duration measurement for a reconcile phase.
+// Phase names are stable so they can be aggregated in log queries:
+// "services", "replsetSpecs" (loop 1) and "replsetClusters" (loop 2).
+func logPhaseDuration(log logr.Logger, phase string, replsetCount int, start time.Time) {
+	log.Info("reconcile phase finished",
+		"phase", phase,
+		"replsetCount", replsetCount,
+		"durationMs", time.Since(start).Milliseconds())
+}
+
+// Concurrency audit for reconcileReplsets
+//
+// Replsets of a single cluster are reconciled by a bounded worker pool. Every
+// goroutine shares the same *api.PerconaServerMongoDB, so the invariant is:
+// nothing reachable from reconcileReplset or reconcileCluster may write to cr.
+// Concurrent map/slice reads are safe; writes are not.
+//
+// Reachable writers, and how each is handled:
+//
+//   - psmdb_controller.go reconcileReplset: used to create the cr.Status.Replsets
+//     entry for its replset. Removed; entries are pre-created serially below.
+//   - mgo.go reconcileCluster: wrote cr.Status.Replsets three times and called
+//     cr.Status.AddCondition twice. Now returns clusterReconcileResult and the
+//     serial merge phase (mergeReplsetResults) applies it.
+//   - version.go fetchVersionFromMongo: writes cr.Status and calls
+//     Status().Update. Hoisted out of the pool and run once per reconcile.
+//   - volume_autoscaling.go updateAutoscalingStatus / triggerResize and
+//     volumes.go handlePVCResizeFailure (revertVolumeTemplate +
+//     k8s.DeannotateObject): deferred to the post-pool drain phase via the ctx
+//     mutation queue (crMutationQueue). When no queue is present in the context
+//     (non-pool callers, e.g. mongos reconciliation or unit tests), mutations
+//     apply immediately and inline so behavior is unchanged.
+//
+// Verified writer-free: statefulset.go (reconcileStatefulSet, reconcilePVCs,
+// reconcilePDB, createOrUpdate), smart.go (smartUpdate only reads
+// cr.Status.State), service.go, and the remaining mgo.go helpers
+// (createOrUpdateSystemUsers, handleReplsetInit, updateConfigMembers,
+// handleReplicaSetNoPrimary).
+//
+// Any new writer must either be refactored to return values that the merge
+// phase applies, or enqueue to the ctx mutation queue.
 func (r *ReconcilePerconaServerMongoDB) reconcileReplsets(ctx context.Context, cr *api.PerconaServerMongoDB, repls []*api.ReplsetSpec) (api.AppState, error) {
 	log := logf.FromContext(ctx)
 
+	servicesStart := time.Now()
 	if err := r.reconcileServices(ctx, cr, repls); err != nil {
 		return "", errors.Wrap(err, "reconcile services")
 	}
+	logPhaseDuration(log, "services", len(repls), servicesStart)
 
+	// Serial pre-pass: validate replset names and make sure every replset has a
+	// status entry, so nothing inside the concurrent region has to create one.
 	for _, replset := range repls {
 		if cr.Spec.Sharding.Enabled && replset.ClusterRole != api.ClusterRoleConfigSvr && replset.Name == api.ConfigReplSetName {
 			return "", errors.Errorf("%s is reserved name for config server replset", api.ConfigReplSetName)
 		}
 
-		if err := r.reconcileReplset(ctx, cr, replset); err != nil {
-			return "", errors.Wrapf(err, "reconcile replset %s", replset.Name)
+		if _, ok := cr.Status.Replsets[replset.Name]; !ok {
+			cr.Status.Replsets[replset.Name] = api.ReplsetStatus{}
 		}
+	}
 
-		// TODO: why do we do it for each replset??
-		if err := r.fetchVersionFromMongo(ctx, cr, replset); err != nil {
+	specsStart := time.Now()
+	err := r.reconcileReplsetSpecs(ctx, cr, repls)
+	logPhaseDuration(log, "replsetSpecs", len(repls), specsStart)
+	if err != nil {
+		return "", err
+	}
+
+	// This used to run once per replset inside the loop above ("TODO: why do we
+	// do it for each replset??"). Its guards make every call after the first a
+	// no-op, and it writes cr.Status plus issues a Status().Update, so it runs
+	// exactly once and outside the concurrent region.
+	if len(repls) > 0 {
+		if err := r.fetchVersionFromMongo(ctx, cr, repls[0]); err != nil {
 			return "", errors.Wrap(err, "update mongo version")
 		}
 	}
@@ -584,42 +783,135 @@ func (r *ReconcilePerconaServerMongoDB) reconcileReplsets(ctx context.Context, c
 		return "", errors.Wrap(err, "get pods list for mongos")
 	}
 
-	var errs []error
-	clusterStatus := api.AppStateNone
-	for _, replset := range repls {
-		replsetStatus, members, err := r.reconcileCluster(ctx, cr, replset, mongosPods.Items)
+	clustersStart := time.Now()
+	clusterStatus, err := r.reconcileReplsetClusters(ctx, cr, repls, mongosPods.Items)
+	logPhaseDuration(log, "replsetClusters", len(repls), clustersStart)
+
+	return clusterStatus, err
+}
+
+// statusPriority orders replset states from most to least severe. The cluster
+// state is the most severe state of any replset.
+var statusPriority = []api.AppState{
+	api.AppStateError,
+	api.AppStateStopping,
+	api.AppStatePaused,
+	api.AppStateInit,
+	api.AppStateReady,
+}
+
+// replsetClusterResult pairs a replset with the outcome of its reconcileCluster
+// call. Workers fill in their own slot in a pre-sized slice, so the merge phase
+// can walk results in input order regardless of completion order.
+type replsetClusterResult struct {
+	name   string
+	result clusterReconcileResult
+	err    error
+}
+
+// reconcileReplsetClusters runs reconcileCluster for every replset, up to
+// r.replsetLimit() at a time, then merges the results into cr.Status serially.
+//
+// When sharding is enabled the config server replset is reconciled on its own
+// first, before any shard replset starts.
+//
+// Unlike the resource loop, this phase collects all errors instead of aborting on
+// the first one: workers stash their error in their own result slot and never
+// fail the group, and the merge phase joins them.
+func (r *ReconcilePerconaServerMongoDB) reconcileReplsetClusters(
+	ctx context.Context,
+	cr *api.PerconaServerMongoDB,
+	repls []*api.ReplsetSpec,
+	mongosPods []corev1.Pod,
+) (api.AppState, error) {
+	log := logf.FromContext(ctx)
+
+	reconcileOne := func(ctx context.Context, replset *api.ReplsetSpec) replsetClusterResult {
+		start := time.Now()
+		res, err := r.reconcileCluster(ctx, cr, replset, mongosPods)
+		log.V(1).Info("reconciled replset cluster",
+			"phase", "replsetClusters",
+			"replset", replset.Name,
+			"durationMs", time.Since(start).Milliseconds())
 		if err != nil {
 			log.Error(err, "failed to reconcile cluster", "replset", replset.Name)
-			errs = append(errs, err)
+		}
+		return replsetClusterResult{name: replset.Name, result: res, err: err}
+	}
+
+	results := make([]replsetClusterResult, len(repls))
+
+	poolStart := 0
+	if cr.Spec.Sharding.Enabled && len(repls) > 0 && repls[0].ClusterRole == api.ClusterRoleConfigSvr {
+		results[0] = reconcileOne(ctx, repls[0])
+		poolStart = 1
+	}
+
+	g := new(errgroup.Group)
+	g.SetLimit(r.replsetLimit())
+
+	for i := poolStart; i < len(repls); i++ {
+		g.Go(func() error {
+			results[i] = reconcileOne(ctx, repls[i])
+			return nil
+		})
+	}
+
+	// Workers never return an error, so this only waits for the pool to drain.
+	_ = g.Wait()
+
+	return mergeReplsetResults(log, cr, results)
+}
+
+// mergeReplsetResults applies the results of a replset reconcile pass to
+// cr.Status. It is the only place cr.Status is mutated for the cluster loop, and
+// it walks results in input order so the outcome does not depend on which
+// goroutine finished first.
+func mergeReplsetResults(log logr.Logger, cr *api.PerconaServerMongoDB, results []replsetClusterResult) (api.AppState, error) {
+	var errs []error
+	clusterStatus := api.AppStateNone
+
+	for _, res := range results {
+		if res.err != nil {
+			errs = append(errs, res.err)
 		}
 
-		switch replsetStatus {
+		switch res.result.state {
 		case api.AppStateInit, api.AppStateError:
-			log.V(1).Info("Replset status is not healthy", "replset", replset.Name, "status", replsetStatus)
+			log.V(1).Info("Replset status is not healthy", "replset", res.name, "status", res.result.state)
 		}
 
-		statusPriority := []api.AppState{
-			api.AppStateError,
-			api.AppStateStopping,
-			api.AppStatePaused,
-			api.AppStateInit,
-			api.AppStateReady,
-		}
 		for _, s := range statusPriority {
-			if replsetStatus == s || clusterStatus == s {
+			if res.result.state == s || clusterStatus == s {
 				clusterStatus = s
 				break
 			}
 		}
 
-		if rs, ok := cr.Status.Replsets[replset.Name]; ok {
-			rs.Members = make(map[string]api.ReplsetMemberStatus)
-			for pod, member := range members {
-				rs.Members[pod] = member
-			}
-			cr.Status.Replsets[replset.Name] = rs
+		for _, c := range res.result.conditions {
+			cr.Status.AddCondition(c)
 		}
+
+		rs, ok := cr.Status.Replsets[res.name]
+		if !ok {
+			continue
+		}
+
+		if res.result.setInitialized {
+			rs.Initialized = true
+		}
+		if res.result.addedAsShard != nil {
+			rs.AddedAsShard = res.result.addedAsShard
+		}
+
+		rs.Members = make(map[string]api.ReplsetMemberStatus, len(res.result.members))
+		for pod, member := range res.result.members {
+			rs.Members[pod] = member
+		}
+
+		cr.Status.Replsets[res.name] = rs
 	}
+
 	return clusterStatus, stderrors.Join(errs...)
 }
 

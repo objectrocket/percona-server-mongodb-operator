@@ -189,7 +189,13 @@ func (r *ReconcilePerconaServerMongoDB) calculateNewSize(
 	return newSize
 }
 
-// triggerResize updates the CR volumeSpec to trigger a resize operation
+// triggerResize updates the CR volumeSpec to trigger a resize operation.
+//
+// When called from inside the parallel replset pool (a crMutationQueue is
+// present in ctx), the actual CR mutation and patch are deferred to the
+// post-pool drain phase so no concurrent read of cr.Spec can race with this
+// write. When no queue is present (e.g. mongos reconciliation or unit tests
+// that call this path directly), the mutation applies immediately and inline.
 func (r *ReconcilePerconaServerMongoDB) triggerResize(
 	ctx context.Context,
 	cr *api.PerconaServerMongoDB,
@@ -199,22 +205,35 @@ func (r *ReconcilePerconaServerMongoDB) triggerResize(
 ) error {
 	log := logf.FromContext(ctx).WithName("StorageAutoscaling").WithValues("pvc", pvc.Name)
 
-	orig := cr.DeepCopy()
+	mutationName := "triggerResize/" + pvc.Name
+	applyFn := func(ctx context.Context) error {
+		orig := cr.DeepCopy()
 
-	volumeSpec.PersistentVolumeClaim.Resources.Requests[corev1.ResourceStorage] = newSize
+		volumeSpec.PersistentVolumeClaim.Resources.Requests[corev1.ResourceStorage] = newSize
 
-	if err := r.client.Patch(ctx, cr.DeepCopy(), client.MergeFrom(orig)); err != nil {
-		return errors.Wrap(err, "patch CR with new storage size")
+		if err := r.client.Patch(ctx, cr.DeepCopy(), client.MergeFrom(orig)); err != nil {
+			return errors.Wrap(err, "patch CR with new storage size")
+		}
+
+		log.Info("storage autoscaling initiated",
+			"oldSize", pvc.Status.Capacity.Storage().String(),
+			"newSize", newSize.String())
+		return nil
 	}
 
-	log.Info("storage autoscaling initiated",
-		"oldSize", pvc.Status.Capacity.Storage().String(),
-		"newSize", newSize.String())
+	if q := crMutationQueueFrom(ctx); q != nil {
+		q.Enqueue(crMutation{name: mutationName, apply: applyFn})
+		return nil
+	}
 
-	return nil
+	return applyFn(ctx)
 }
 
-// updateAutoscalingStatus updates the status for a specific PVC
+// updateAutoscalingStatus updates the status for a specific PVC.
+//
+// When called from inside the parallel replset pool (a crMutationQueue is
+// present in ctx), the status map write is deferred to the post-pool drain
+// phase. When no queue is present, it applies immediately and inline.
 func (r *ReconcilePerconaServerMongoDB) updateAutoscalingStatus(
 	ctx context.Context,
 	cr *api.PerconaServerMongoDB,
@@ -229,30 +248,41 @@ func (r *ReconcilePerconaServerMongoDB) updateAutoscalingStatus(
 		return
 	}
 
-	if cr.Status.StorageAutoscaling == nil {
-		cr.Status.StorageAutoscaling = make(map[string]api.StorageAutoscalingStatus)
-	}
-
-	status := cr.Status.StorageAutoscaling[pvcName]
-
-	if usage != nil {
-		newSize := resource.NewQuantity(usage.TotalBytes, resource.BinarySI)
-		if status.CurrentSize != "" {
-			oldSize, parseErr := resource.ParseQuantity(status.CurrentSize)
-			if parseErr == nil && newSize.Cmp(oldSize) > 0 {
-				status.LastResizeTime = metav1.Time{Time: time.Now()}
-				status.ResizeCount++
-			}
+	mutationName := "updateAutoscalingStatus/" + pvcName
+	applyFn := func(_ context.Context) error {
+		if cr.Status.StorageAutoscaling == nil {
+			cr.Status.StorageAutoscaling = make(map[string]api.StorageAutoscalingStatus)
 		}
-		status.CurrentSize = newSize.String()
-		status.LastError = ""
+
+		status := cr.Status.StorageAutoscaling[pvcName]
+
+		if usage != nil {
+			newSize := resource.NewQuantity(usage.TotalBytes, resource.BinarySI)
+			if status.CurrentSize != "" {
+				oldSize, parseErr := resource.ParseQuantity(status.CurrentSize)
+				if parseErr == nil && newSize.Cmp(oldSize) > 0 {
+					status.LastResizeTime = metav1.Time{Time: time.Now()}
+					status.ResizeCount++
+				}
+			}
+			status.CurrentSize = newSize.String()
+			status.LastError = ""
+		}
+
+		if err != nil {
+			status.LastError = err.Error()
+		}
+
+		cr.Status.StorageAutoscaling[pvcName] = status
+		return nil
 	}
 
-	if err != nil {
-		status.LastError = err.Error()
+	if q := crMutationQueueFrom(ctx); q != nil {
+		q.Enqueue(crMutation{name: mutationName, apply: applyFn})
+		return
 	}
 
-	cr.Status.StorageAutoscaling[pvcName] = status
+	_ = applyFn(ctx)
 }
 
 // extractPodNameFromPVC extracts the pod name from a PVC name
