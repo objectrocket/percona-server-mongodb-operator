@@ -188,6 +188,8 @@ spec:
           value: "true"
         - name: PBM_AGENT_SIDECAR_SLEEP
           value: "5"
+        - name: GOMAXPROCS
+          value: "2"
         - name: SHARDED
           value: "TRUE"
         - name: POD_NAME

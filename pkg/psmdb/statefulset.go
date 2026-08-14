@@ -558,6 +558,13 @@ func backupAgentContainer(ctx context.Context, cr *api.PerconaServerMongoDB, rep
 				Name:  "PBM_AGENT_SIDECAR_SLEEP",
 				Value: "5",
 			},
+			{
+				// GOMAXPROCS limits Go runtime parallelism to match container CPU limits.
+				// Without this, PBM uses host NumCPU() for concurrency calculations,
+				// causing excessive connections to S3/ECS storage (LIB-1228).
+				Name:  "GOMAXPROCS",
+				Value: "2",
+			},
 		},
 		SecurityContext: cr.Spec.Backup.ContainerSecurityContext,
 		Resources:       cr.Spec.Backup.Resources,
