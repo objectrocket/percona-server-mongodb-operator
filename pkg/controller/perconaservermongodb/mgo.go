@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"go.mongodb.org/mongo-driver/x/mongo/driver/topology"
+	"go.mongodb.org/mongo-driver/v2/x/mongo/driver/topology"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +31,42 @@ import (
 )
 
 var errReplsetLimit = fmt.Errorf("maximum replset member (%d) count reached", mongo.MaxMembers)
+
+func defaultRWConcern(cr *api.PerconaServerMongoDB) (string, string, int) {
+	readConcern, writeConcernW, writeConcernWTimeout := mongo.DefaultReadConcern, mongo.DefaultWriteConcern, 0
+	c := cr.Spec.DefaultRWConcern
+	if c == nil {
+		return readConcern, writeConcernW, writeConcernWTimeout
+	}
+	if c.ReadConcern != "" {
+		readConcern = c.ReadConcern
+	}
+	if c.WriteConcern != nil {
+		if c.WriteConcern.W != "" {
+			writeConcernW = c.WriteConcern.W
+		}
+		writeConcernWTimeout = c.WriteConcern.WTimeout
+	}
+	return readConcern, writeConcernW, writeConcernWTimeout
+}
+
+// PSA replsets need the explicit push since MongoDB's implicit default is w:1; user-set
+// values must also be propagated. Sharded clusters are handled via mongos.
+func shouldSetDefaultRWConcern(cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec) bool {
+	if cr.Spec.Sharding.Enabled {
+		return false
+	}
+
+	externalArbiterFound := false
+	for _, ext := range replset.ExternalNodes {
+		if ext.ArbiterOnly {
+			externalArbiterFound = true
+			break
+		}
+	}
+
+	return replset.Arbiter.Enabled || externalArbiterFound || cr.Spec.DefaultRWConcern != nil
+}
 
 func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, mongosPods []corev1.Pod) (api.AppState, map[string]api.ReplsetMemberStatus, error) {
 	log := logf.FromContext(ctx)
@@ -97,7 +133,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 			return api.AppStateInit, nil, nil
 		}
 		if cr.Status.Replsets[replset.Name].Initialized {
-			if errors.Is(err, topology.ErrServerSelectionTimeout) && strings.Contains(err.Error(), "ReplicaSetNoPrimary") {
+			if errors.As(err, &topology.ServerSelectionError{}) && strings.Contains(err.Error(), "ReplicaSetNoPrimary") {
 				log.Error(err, "FULL CLUSTER CRASH")
 
 				err := r.handleReplicaSetNoPrimary(ctx, cr, replset, pods.Items)
@@ -205,7 +241,8 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 				}
 			}()
 
-			err = mongosSession.SetDefaultRWConcern(ctx, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
+			readConcern, writeConcernW, writeConcernWTimeout := defaultRWConcern(cr)
+			err = mongosSession.SetDefaultRWConcern(ctx, readConcern, writeConcernW, writeConcernWTimeout)
 			// SetDefaultRWConcern introduced in MongoDB 4.4
 			if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
 				return api.AppStateError, nil, errors.Wrap(err, "set default RW concern")
@@ -239,8 +276,9 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 		}
 	}
 
-	if replset.Arbiter.Enabled && !cr.Spec.Sharding.Enabled {
-		err := cli.SetDefaultRWConcern(ctx, mongo.DefaultReadConcern, mongo.DefaultWriteConcern)
+	if shouldSetDefaultRWConcern(cr, replset) {
+		readConcern, writeConcernW, writeConcernWTimeout := defaultRWConcern(cr)
+		err := cli.SetDefaultRWConcern(ctx, readConcern, writeConcernW, writeConcernWTimeout)
 		// SetDefaultRWConcern introduced in MongoDB 4.4
 		if err != nil && !strings.Contains(err.Error(), "CommandNotFound") {
 			return api.AppStateError, nil, errors.Wrap(err, "set default RW concern")
@@ -334,16 +372,19 @@ func (r *ReconcilePerconaServerMongoDB) getConfigMemberForExternalNode(id int, e
 		Votes:        extNode.Votes,
 		Priority:     extNode.Priority,
 		BuildIndexes: true,
-		Tags:         mongo.ReplsetTags{"external": "true"},
+		ArbiterOnly:  extNode.ArbiterOnly,
 	}
 
-	if strings.Contains(extNode.Host, ":") {
-		member.Host = extNode.Host
-	} else {
-		member.Host = extNode.HostPort()
+	if !extNode.ArbiterOnly {
+		member.Tags = mongo.ReplsetTags{"external": "true"}
 	}
+
+	member.Host = extNode.HostPort()
 
 	for k, v := range extNode.Tags {
+		if member.Tags == nil {
+			member.Tags = make(mongo.ReplsetTags)
+		}
 		member.Tags[k] = v
 	}
 
@@ -504,22 +545,37 @@ func (r *ReconcilePerconaServerMongoDB) updateConfigMembers(ctx context.Context,
 		return rsMembers, 0, errors.Wrap(err, "unable to get replset members")
 	}
 
-	liveMembers := 0
+	liveMembers := countLiveMembers(rsStatus, cnf, rs, rsMembers)
+
+	return rsMembers, liveMembers, nil
+}
+
+// countLiveMembers counts the members reported as live (primary, secondary or
+// arbiter) in the replset status, ignoring external members and external
+// arbiters. It also populates rsMembers with the status of every member that
+// maps to an operator-managed pod (identified by the podName tag).
+func countLiveMembers(rsStatus mongo.Status, cnf mongo.RSConfig, rs *api.ReplsetSpec, rsMembers map[string]api.ReplsetMemberStatus) int {
+	count := 0
 	for _, member := range rsStatus.Members {
-		var tags mongo.ReplsetTags
+		var cm mongo.ConfigMember
 
 		for i := range cnf.Members {
 			if member.Id == cnf.Members[i].ID {
-				tags = cnf.Members[i].Tags
+				cm = cnf.Members[i]
 				break
 			}
 		}
 
-		if _, ok := tags["external"]; ok {
+		if _, ok := cm.Tags["external"]; ok {
 			continue
 		}
 
-		if podName, ok := tags["podName"]; ok {
+		// arbiters can't have tags
+		if cm.ArbiterOnly && isExternalArbiter(cm, rs) {
+			continue
+		}
+
+		if podName, ok := cm.Tags["podName"]; ok {
 			rsMembers[podName] = api.ReplsetMemberStatus{
 				Name:     member.Name,
 				State:    member.State,
@@ -529,11 +585,25 @@ func (r *ReconcilePerconaServerMongoDB) updateConfigMembers(ctx context.Context,
 
 		switch member.State {
 		case mongo.MemberStatePrimary, mongo.MemberStateSecondary, mongo.MemberStateArbiter:
-			liveMembers++
+			count++
 		}
 	}
 
-	return rsMembers, liveMembers, nil
+	return count
+}
+
+func isExternalArbiter(cm mongo.ConfigMember, rs *api.ReplsetSpec) bool {
+	for _, extNode := range rs.ExternalNodes {
+		if !extNode.ArbiterOnly {
+			continue
+		}
+
+		if cm.Host == extNode.HostPort() {
+			return true
+		}
+	}
+
+	return false
 }
 
 func inShard(ctx context.Context, client mongo.Client, rsName string) (bool, error) {
@@ -748,20 +818,9 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, c
 		}
 		log.Info("replset initialized", "replset", replsetName, "pod", pod.Name)
 
-		log.Info("creating user admin", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
-		userAdmin, err := getInternalCredentials(ctx, r.client, cr, api.RoleUserAdmin)
-		if err != nil {
-			return nil, nil, errors.Wrap(err, "failed to get userAdmin credentials")
+		if err := r.createUserAdminIfNeeded(ctx, cr, &pod, replsetName, mongoCmd); err != nil {
+			return nil, nil, err
 		}
-
-		cmd[2] = fmt.Sprintf(`%s --eval %s`, mongoCmd, mongoInitAdminUser(userAdmin.Username, userAdmin.Password))
-		errb.Reset()
-		outb.Reset()
-		err = r.clientcmd.Exec(ctx, &pod, "mongod", cmd, nil, &outb, &errb, false)
-		if err != nil {
-			return nil, nil, fmt.Errorf("exec add admin user: %v / %s / %s", err, outb.String(), errb.String())
-		}
-		log.Info("user admin created", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
 
 		return &pod, &api.ReplsetMemberStatus{
 			Name:     member.Host,
@@ -771,6 +830,82 @@ func (r *ReconcilePerconaServerMongoDB) handleReplsetInit(ctx context.Context, c
 	}
 
 	return nil, nil, errNoRunningMongodContainers
+}
+
+func (r *ReconcilePerconaServerMongoDB) createUserAdminIfNeeded(ctx context.Context, cr *api.PerconaServerMongoDB, pod *corev1.Pod, replsetName, mongoCmd string) error {
+	log := logf.FromContext(ctx)
+
+	userAdmin, err := getInternalCredentials(ctx, r.client, cr, api.RoleUserAdmin)
+	if err != nil {
+		return errors.Wrap(err, "failed to get userAdmin credentials")
+	}
+
+	canAuth, err := r.userAdminCanAuthenticate(ctx, pod, mongoCmd, userAdmin.Username, userAdmin.Password)
+	if err != nil {
+		return err
+	}
+	if canAuth {
+		log.Info("user admin already exists and can authenticate, skipping creation", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
+		return nil
+	}
+
+	log.Info("creating user admin", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
+
+	var outb, errb bytes.Buffer
+	cmd := []string{
+		"sh", "-c",
+		fmt.Sprintf(`%s --eval %s`, mongoCmd, mongoInitAdminUser(userAdmin.Username, userAdmin.Password)),
+	}
+
+	err = r.clientcmd.Exec(ctx, pod, "mongod", cmd, nil, &outb, &errb, false)
+	if err != nil {
+		canAuth, authErr := r.userAdminCanAuthenticate(ctx, pod, mongoCmd, userAdmin.Username, userAdmin.Password)
+		if authErr != nil {
+			return fmt.Errorf("exec add admin user: %v / %s / %s; check userAdmin authentication: %v", err, outb.String(), errb.String(), authErr)
+		}
+		if !canAuth {
+			return fmt.Errorf("exec add admin user: %v / %s / %s", err, outb.String(), errb.String())
+		}
+		log.Info("user admin can authenticate after createUser error, continuing", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
+		return nil
+	}
+
+	log.Info("user admin created", "replset", replsetName, "pod", pod.Name, "user", api.RoleUserAdmin)
+	return nil
+}
+
+func (r *ReconcilePerconaServerMongoDB) userAdminCanAuthenticate(ctx context.Context, pod *corev1.Pod, mongoCmd, user, pwd string) (bool, error) {
+	log := logf.FromContext(ctx)
+
+	var outb, errb bytes.Buffer
+	cmd := []string{
+		"sh", "-c",
+		fmt.Sprintf(
+			`%s --quiet -u '%s' -p '%s' --authenticationDatabase admin --eval 'quit(db.adminCommand({connectionStatus: 1}).authInfo.authenticatedUsers.length > 0 ? 0 : 1)'`,
+			mongoCmd,
+			strings.ReplaceAll(user, "'", `'"'"'`),
+			strings.ReplaceAll(pwd, "'", `'"'"'`),
+		),
+	}
+
+	if err := r.clientcmd.Exec(ctx, pod, "mongod", cmd, nil, &outb, &errb, false); err != nil {
+		if isMongoAuthFailure(err, outb.String(), errb.String()) {
+			log.V(1).Info("userAdmin authentication failed", "pod", pod.Name, "error", err, "stdout", outb.String(), "stderr", errb.String())
+			return false, nil
+		}
+
+		return false, fmt.Errorf("exec userAdmin authentication check: %v / %s / %s", err, outb.String(), errb.String())
+	}
+
+	return true, nil
+}
+
+func isMongoAuthFailure(err error, stdout, stderr string) bool {
+	msg := strings.ToLower(strings.Join([]string{err.Error(), stdout, stderr}, " "))
+	return strings.Contains(msg, "authentication failed") ||
+		strings.Contains(msg, "auth failed") ||
+		strings.Contains(msg, "requires authentication") ||
+		strings.Contains(msg, "unauthorized")
 }
 
 func (r *ReconcilePerconaServerMongoDB) handleReplicaSetNoPrimary(ctx context.Context, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, pods []corev1.Pod) error {
@@ -1033,6 +1168,9 @@ func (r *ReconcilePerconaServerMongoDB) createOrUpdateSystemUsers(ctx context.Co
 	}
 
 	users := []api.SystemUserRole{api.RoleClusterAdmin, api.RoleClusterMonitor, api.RoleBackup, api.RoleDatabaseAdmin}
+	if cr.IsSearchEnabled() {
+		users = append(users, api.RoleSearch)
+	}
 
 	for _, role := range users {
 		creds, err := getInternalCredentials(ctx, r.client, cr, role)

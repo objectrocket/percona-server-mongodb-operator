@@ -83,14 +83,13 @@ func TestReconcileStatefulSet(t *testing.T) {
 		additionalObjs []client.Object
 
 		expectedSts *appsv1.StatefulSet
-	}{
-		{
-			name:        "rs0-mongod",
-			cr:          defaultCR.DeepCopy(),
-			rsName:      "rs0",
-			component:   naming.ComponentMongod,
-			expectedSts: expectedSts(t, "reconcile-statefulset/rs0-mongod.yaml"),
-		},
+	}{{
+		name:        "rs0-mongod",
+		cr:          defaultCR.DeepCopy(),
+		rsName:      "rs0",
+		component:   naming.ComponentMongod,
+		expectedSts: expectedSts(t, "reconcile-statefulset/rs0-mongod.yaml"),
+	},
 		{
 			name:        "rs0-arbiter",
 			cr:          defaultCR.DeepCopy(),
@@ -293,8 +292,8 @@ func compareSts(t *testing.T, got, want *appsv1.StatefulSet) {
 	compareObjectMeta(got.ObjectMeta, want.ObjectMeta)
 
 	compareSpec := func(got, want appsv1.StatefulSetSpec) {
-		delete(got.Template.Annotations, "percona.com/ssl-hash")
-		delete(got.Template.Annotations, "percona.com/ssl-internal-hash")
+		delete(got.Template.Annotations, naming.AnnotationSSLHash)
+		delete(got.Template.Annotations, naming.AnnotationSSLInternalHash)
 		gotBytes, err := yaml.Marshal(got)
 		if err != nil {
 			t.Fatalf("error marshaling got: %v", err)

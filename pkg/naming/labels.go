@@ -32,6 +32,20 @@ func Labels() map[string]string {
 	}
 }
 
+func PVCLabels(
+	component string,
+	replsetName string,
+	instanceName string,
+) map[string]string {
+	labels := Labels()
+
+	labels[LabelKubernetesComponent] = component
+	labels[LabelKubernetesReplset] = replsetName
+	labels[LabelKubernetesInstance] = instanceName
+
+	return labels
+}
+
 func ClusterLabels(cr *api.PerconaServerMongoDB) map[string]string {
 	l := Labels()
 	l[LabelKubernetesInstance] = cr.Name
@@ -110,5 +124,11 @@ func NewBackupCronJobLabels(cr *api.PerconaServerMongoDB, labels map[string]stri
 
 	ls = util.MapMerge(util.MapCopy(labels), ls)
 
+	return ls
+}
+
+func SearchLabels(cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec) map[string]string {
+	ls := RSLabels(cr, rs)
+	ls[LabelKubernetesComponent] = ComponentSearch
 	return ls
 }
