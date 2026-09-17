@@ -91,7 +91,7 @@ spec:
         - configMapRef:
             name: test-configmap
             optional: true
-        image: percona/percona-server-mongodb:8.0.19-7
+        image: percona/percona-server-mongodb:8.0.26-11
         imagePullPolicy: Always
         livenessProbe:
           exec:
@@ -146,9 +146,6 @@ spec:
         volumeMounts:
         - mountPath: /data/db
           name: mongod-data
-        - mountPath: /etc/mongodb-secrets
-          name: reconcile-statefulset-cr-mongodb-keyfile
-          readOnly: true
         - mountPath: /etc/mongodb-ssl
           name: ssl
           readOnly: true
@@ -199,7 +196,7 @@ spec:
           value: mongodb://$(PBM_AGENT_MONGODB_USERNAME):$(PBM_AGENT_MONGODB_PASSWORD)@localhost:$(PBM_MONGODB_PORT)/?tls=true&tlsCertificateKeyFile=/tmp/tls.pem&tlsCAFile=/etc/mongodb-ssl/ca.crt&tlsInsecure=true
         - name: PBM_AGENT_TLS_ENABLED
           value: "true"
-        image: percona/percona-backup-mongodb:2.12.0
+        image: percona/percona-backup-mongodb:2.15.0
         imagePullPolicy: Always
         name: backup-agent
         resources: {}
@@ -230,7 +227,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.name
-        image: percona/fluentbit:4.0.1-2
+        image: percona/fluentbit:5.0.9-1
         name: logs
         resources:
           requests:
@@ -264,7 +261,7 @@ spec:
               key: MONGODB_CLUSTER_ADMIN_PASSWORD_ESCAPED
               name: internal-reconcile-statefulset-cr-users
               optional: false
-        image: percona/fluentbit:4.0.1-2
+        image: percona/fluentbit:5.0.9-1
         name: logrotate
         resources:
           requests:
@@ -278,7 +275,7 @@ spec:
       initContainers:
       - command:
         - /init-entrypoint.sh
-        image: percona/percona-server-mongodb-operator:1.22.0
+        image: percona/percona-server-mongodb-operator:1.23.0
         imagePullPolicy: Always
         name: mongo-init
         resources:
@@ -289,8 +286,6 @@ spec:
             cpu: 300m
             memory: 1Gi
         volumeMounts:
-        - mountPath: /data/db
-          name: mongod-data
         - mountPath: /opt/percona
           name: bin
       restartPolicy: Always
@@ -299,11 +294,6 @@ spec:
       serviceAccountName: default
       terminationGracePeriodSeconds: 60
       volumes:
-      - name: reconcile-statefulset-cr-mongodb-keyfile
-        secret:
-          defaultMode: 288
-          optional: false
-          secretName: reconcile-statefulset-cr-mongodb-keyfile
       - emptyDir: {}
         name: bin
       - emptyDir: {}

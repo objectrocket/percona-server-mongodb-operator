@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
@@ -23,9 +24,13 @@ type PerconaServerMongoDBRestoreSpec struct {
 	RSMap        map[string]string                 `json:"replsetRemapping,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="(!has(self.nsFrom) && !has(self.nsTo)) || (has(self.nsFrom) && has(self.nsTo))",message="nsFrom and nsTo need to be set together"
+// +kubebuilder:validation:XValidation:rule="(!has(self.nsFrom) && !has(self.nsTo)) || self.nsFrom != self.nsTo",message="nsFrom and nsTo can't be the same"
 type SelectiveRestoreOpts struct {
 	WithUsersAndRoles bool     `json:"withUsersAndRoles,omitempty"`
 	Namespaces        []string `json:"namespaces,omitempty"`
+	NamespaceFrom     string   `json:"nsFrom,omitempty"`
+	NamespaceTo       string   `json:"nsTo,omitempty"`
 }
 
 func (s *SelectiveRestoreOpts) GetNamespaces() []string {
@@ -40,6 +45,20 @@ func (s *SelectiveRestoreOpts) GetWithUsersAndRoles() bool {
 		return false
 	}
 	return s.WithUsersAndRoles
+}
+
+func (s *SelectiveRestoreOpts) GetNamespaceFrom() string {
+	if s == nil {
+		return ""
+	}
+	return s.NamespaceFrom
+}
+
+func (s *SelectiveRestoreOpts) GetNamespaceTo() string {
+	if s == nil {
+		return ""
+	}
+	return s.NamespaceTo
 }
 
 // RestoreState is for restore status states
@@ -57,13 +76,22 @@ const (
 
 // PerconaServerMongoDBRestoreStatus defines the observed state of PerconaServerMongoDBRestore
 type PerconaServerMongoDBRestoreStatus struct {
-	State          RestoreState `json:"state,omitempty"`
-	PBMname        string       `json:"pbmName,omitempty"`
-	PITRTarget     string       `json:"pitrTarget,omitempty"`
-	Error          string       `json:"error,omitempty"`
-	CompletedAt    *metav1.Time `json:"completed,omitempty"`
-	LastTransition *metav1.Time `json:"lastTransition,omitempty"`
+	State          RestoreState       `json:"state,omitempty"`
+	PBMname        string             `json:"pbmName,omitempty"`
+	PITRTarget     string             `json:"pitrTarget,omitempty"`
+	Error          string             `json:"error,omitempty"`
+	CompletedAt    *metav1.Time       `json:"completed,omitempty"`
+	LastTransition *metav1.Time       `json:"lastTransition,omitempty"`
+	Conditions     []metav1.Condition `json:"conditions,omitempty"`
 }
+
+const (
+	ConditionPBMAgentConfiguredForSnapshot   string = "PBMAgentConfiguredForSnapshot"
+	ConditionReplsetPVCsRestoredFromSnapshot string = "ReplsetPVCsRestoredFromSnapshot"
+	ConditionPBMAgentAwaitingRestoreFinish   string = "PBMAgentAwaitingRestoreFinish"
+	ConditionPBMRestoreFinishing             string = "PBMRestoreFinishing"
+	ConditionPBMRestoreFinished              string = "PBMRestoreFinished"
+)
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
@@ -92,6 +120,18 @@ type PerconaServerMongoDBRestoreList struct {
 	Items           []PerconaServerMongoDBRestore `json:"items"`
 }
 
+func (status *PerconaServerMongoDBRestoreStatus) ConditionsEqual(otherStatus *PerconaServerMongoDBRestoreStatus) bool {
+	if len(status.Conditions) != len(otherStatus.Conditions) {
+		return false
+	}
+	for _, cond := range status.Conditions {
+		if !meta.IsStatusConditionPresentAndEqual(otherStatus.Conditions, cond.Type, cond.Status) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *PerconaServerMongoDBRestore) SetDefaults() error {
 	if bs := r.Spec.BackupSource; bs != nil {
 		if bs.Type == "" {
@@ -101,7 +141,7 @@ func (r *PerconaServerMongoDBRestore) SetDefaults() error {
 	return nil
 }
 
-func (r *PerconaServerMongoDBRestore) CheckFields() error {
+func (r *PerconaServerMongoDBRestore) CheckFields(backupType defs.BackupType) error {
 	if len(r.Spec.ClusterName) == 0 {
 		return fmt.Errorf("spec clusterName field is empty")
 	}
@@ -110,8 +150,12 @@ func (r *PerconaServerMongoDBRestore) CheckFields() error {
 		return errors.New("one of backupName or backupSource is required")
 	}
 
+	if backupType != defs.LogicalBackup && r.IsCloningNamespace() {
+		return errors.New("nsFrom and nsTo are only available for logical backups")
+	}
+
 	if r.Spec.BackupSource != nil {
-		if len(r.Spec.BackupSource.Destination) == 0 {
+		if r.Spec.BackupSource.Type != defs.ExternalBackup && len(r.Spec.BackupSource.Destination) == 0 {
 			return errors.New("backupSource destination is required")
 		}
 
@@ -119,13 +163,20 @@ func (r *PerconaServerMongoDBRestore) CheckFields() error {
 			return errors.New("backupSource destination should use s3 protocol format")
 		}
 
-		if len(r.Spec.StorageName) == 0 &&
+		if r.Spec.BackupSource.OSS != nil && !strings.HasPrefix(r.Spec.BackupSource.Destination, "oss://") {
+			return errors.New("backupSource destination should use oss protocol format")
+		}
+
+		if backupType != defs.ExternalBackup &&
+			len(r.Spec.StorageName) == 0 &&
 			r.Spec.BackupSource.S3 == nil &&
 			r.Spec.BackupSource.GCS == nil &&
 			r.Spec.BackupSource.Azure == nil &&
 			r.Spec.BackupSource.Minio == nil &&
+			r.Spec.BackupSource.OSS == nil &&
+			r.Spec.BackupSource.OCI == nil &&
 			r.Spec.BackupSource.Filesystem == nil {
-			return errors.New("one of storageName, backupSource.minio, backupSource.s3, backupSource.gcs, backupSource.azure or backupSource.filesystem is required")
+			return errors.New("one of storageName, backupSource.minio, backupSource.s3, backupSource.gcs, backupSource.azure, backupSource.oss, backupSource.oci or backupSource.filesystem is required")
 		}
 	}
 
@@ -145,6 +196,10 @@ func (r *PerconaServerMongoDBRestore) CheckFields() error {
 	}
 
 	return nil
+}
+
+func (r *PerconaServerMongoDBRestore) IsCloningNamespace() bool {
+	return r.Spec.Selective != nil && r.Spec.Selective.NamespaceFrom != ""
 }
 
 // +kubebuilder:validation:Type=string

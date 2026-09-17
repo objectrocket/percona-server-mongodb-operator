@@ -2,13 +2,14 @@ package perconaservermongodb
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	"go.mongodb.org/mongo-driver/mongo/options"
-	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -17,8 +18,109 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	api "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"github.com/percona/percona-server-mongodb-operator/pkg/naming"
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
+	"github.com/percona/percona-server-mongodb-operator/pkg/version"
 )
+
+// mockMongoClientForRoles is a minimal mock to test updateRoles behavior.
+type mockMongoClientForRoles struct {
+	mongo.Client
+	updateRolesCalled bool
+}
+
+func (m *mockMongoClientForRoles) UpdateUserRoles(ctx context.Context, db, username string, roles []mongo.Role) error {
+	m.updateRolesCalled = true
+	return nil
+}
+
+func TestUpdateRoles(t *testing.T) {
+	tests := []struct {
+		name               string
+		user               *api.User
+		userInfo           *mongo.User
+		expectUpdateCalled bool
+	}{
+		{
+			name: "same roles same order - no update",
+			user: &api.User{
+				Name: "testuser",
+				DB:   "testdb",
+				Roles: []api.UserRole{
+					{Name: "readWrite", DB: "db1"},
+					{Name: "read", DB: "db2"},
+				},
+			},
+			userInfo: &mongo.User{
+				Roles: []mongo.Role{
+					{Role: "readWrite", DB: "db1"},
+					{Role: "read", DB: "db2"},
+				},
+			},
+			expectUpdateCalled: false,
+		},
+		{
+			name: "same roles different order - no update",
+			user: &api.User{
+				Name: "testuser",
+				DB:   "testdb",
+				Roles: []api.UserRole{
+					{Name: "readWrite", DB: "db1"},
+					{Name: "clusterMonitor", DB: "admin"},
+					{Name: "readWrite", DB: "db2"},
+				},
+			},
+			userInfo: &mongo.User{
+				Roles: []mongo.Role{
+					{Role: "clusterMonitor", DB: "admin"},
+					{Role: "readWrite", DB: "db2"},
+					{Role: "readWrite", DB: "db1"},
+				},
+			},
+			expectUpdateCalled: false,
+		},
+		{
+			name: "different roles - update called",
+			user: &api.User{
+				Name: "testuser",
+				DB:   "testdb",
+				Roles: []api.UserRole{
+					{Name: "readWrite", DB: "db1"},
+					{Name: "read", DB: "db2"},
+				},
+			},
+			userInfo: &mongo.User{
+				Roles: []mongo.Role{
+					{Role: "readWrite", DB: "db1"},
+					{Role: "readWrite", DB: "db3"},
+				},
+			},
+			expectUpdateCalled: true,
+		},
+		{
+			name: "nil userInfo - no update",
+			user: &api.User{
+				Name: "testuser",
+				DB:   "testdb",
+				Roles: []api.UserRole{
+					{Name: "readWrite", DB: "db1"},
+				},
+			},
+			userInfo:           nil,
+			expectUpdateCalled: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockMongoClientForRoles{}
+			err := updateRoles(t.Context(), mock, tt.user, tt.userInfo)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectUpdateCalled, mock.updateRolesCalled,
+				"UpdateUserRoles called = %v, want %v", mock.updateRolesCalled, tt.expectUpdateCalled)
+		})
+	}
+}
 
 func TestRolesChanged(t *testing.T) {
 	r2 := &mongo.Role{
@@ -398,12 +500,16 @@ func TestGetCustomUserSecret(t *testing.T) {
 			if tt.hasExistingSecret && tt.errMsg == "" {
 				assert.NoError(t, err)
 				assert.Equal(t, secret.Name, "custom-secret")
+				assert.Equal(t, tt.user.SecretName(cr), secret.Name)
+				assert.Equal(t, naming.SecretCustomUserConnStrName(cr, tt.user), secret.Name+"-conn-str")
 				assert.Equal(t, string(secret.Data[passKey]), "existing-password")
 				return
 			}
 			if !tt.hasExistingSecret && tt.errMsg == "" {
 				assert.NoError(t, err)
 				assert.Equal(t, secret.Name, tt.crName+"-custom-user-secret")
+				assert.Equal(t, tt.user.SecretName(cr), secret.Name)
+				assert.Equal(t, naming.SecretCustomUserConnStrName(cr, tt.user), secret.Name+"-conn-str")
 				assert.NotEmpty(t, string(secret.Data[passKey]))
 			}
 			if tt.errMsg != "" {
@@ -451,7 +557,7 @@ type noopMongoClient struct {
 }
 
 func (c *noopMongoClient) Disconnect(ctx context.Context) error { return nil }
-func (c *noopMongoClient) Database(name string, opts ...*options.DatabaseOptions) mongo.ClientDatabase {
+func (c *noopMongoClient) Database(name string, opts ...options.Lister[options.DatabaseOptions]) mongo.ClientDatabase {
 	return nil
 }
 func (c *noopMongoClient) Ping(ctx context.Context, rp *readpref.ReadPref) error { return nil }
@@ -512,7 +618,7 @@ func (c *noopMongoClient) IsMaster(ctx context.Context) (*mongo.IsMasterResp, er
 	return &mongo.IsMasterResp{}, nil
 }
 func (c *noopMongoClient) Freeze(ctx context.Context, seconds int) error { return nil }
-func (c *noopMongoClient) SetDefaultRWConcern(ctx context.Context, readConcern, writeConcern string) error {
+func (c *noopMongoClient) SetDefaultRWConcern(ctx context.Context, readConcern, writeConcern string, writeConcernWTimeout int) error {
 	return nil
 }
 func (c *noopMongoClient) AddShard(ctx context.Context, rsName, host string) error { return nil }
@@ -558,8 +664,14 @@ func TestReconcileCustomUsers_ShardedPropagation(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: api.PerconaServerMongoDBSpec{
+			CRVersion:               version.Version(),
+			ClusterServiceDNSMode:   api.DNSModeInternal,
+			ClusterServiceDNSSuffix: "svc.cluster.local",
+			TLS:                     &api.TLSSpec{Mode: api.TLSModeDisabled},
+			Secrets:                 &api.SecretsSpec{},
 			Sharding: api.Sharding{
 				Enabled: true,
+				Mongos:  &api.MongosSpec{},
 			},
 			Replsets: []*api.ReplsetSpec{
 				{Name: "rs0"},
@@ -692,6 +804,91 @@ func TestUpdateRoles_OrderInsensitive(t *testing.T) {
 	}
 }
 
+func TestBuildAnnotationKey(t *testing.T) {
+	tests := []struct {
+		name      string
+		crName    string
+		crVersion *string
+		userName  string
+		want      string
+	}{
+		{
+			name:     "short names",
+			crName:   "my-cluster",
+			userName: "user1",
+			want:     "percona.com/jutnf2os64q2pc2xoctfhea46fv4prb3amrfpvxdoxayh3vul3gq",
+		},
+		{
+			name:     "user name fills the old limit",
+			crName:   "a",
+			userName: strings.Repeat("x", 44),
+			want:     "percona.com/g76mrdlwvbdpwmj3oocsvaxq2aqlfk4k5m2xj557vtrennb42pmq",
+		},
+		{
+			name:     "both names exceed the old limit",
+			crName:   "very-long-cluster-name-that-exceeds",
+			userName: "very-long-user-name-that-also-exceeds",
+			want:     "percona.com/7grtpeecp5s6efjbylgpwojvpr5hwo7np6c2ccj6jbpsbk3xw6gq",
+		},
+		{
+			name:     "very long cluster name",
+			crName:   strings.Repeat("a", 100),
+			userName: "user",
+			want:     "percona.com/vjvkygmvzldwvj6m3x4lzu7s3dvp5mwqstqbcxpooxudohhek5dq",
+		},
+		{
+			name:     "very long user name",
+			crName:   "cluster",
+			userName: strings.Repeat("b", 100),
+			want:     "percona.com/pfu7boshbs4o6gyzm3gf4vkt4mptio5uorthdt5qhu3su5dwiaeq",
+		},
+		{
+			name:     "both names very long",
+			crName:   strings.Repeat("c", 50),
+			userName: strings.Repeat("d", 50),
+			want:     "percona.com/4ztrxbkdt2ldokrlo6plgpp2vapvt66ivyvgdfuvixfk5zyofc3q",
+		},
+		{
+			name:      "v1.22.0 behavior",
+			crName:    "my-cluster-name",
+			crVersion: new("1.22.0"),
+			userName:  "my-custom-user",
+			want:      "percona.com/my-cluster-name-my-custom-user-hash",
+		},
+	}
+
+	const prefix = "percona.com/"
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cr := &api.PerconaServerMongoDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      tt.crName,
+					Namespace: "namespace",
+				},
+				Spec: api.PerconaServerMongoDBSpec{
+					CRVersion: version.Version(),
+				},
+			}
+			if tt.crVersion != nil {
+				cr.Spec.CRVersion = *tt.crVersion
+			}
+
+			got := buildAnnotationKey(cr, tt.userName)
+
+			assert.Equal(t, tt.want, got, "buildAnnotationKey() = %v, want %v", got, tt.want)
+
+			assert.True(t, strings.HasPrefix(got, prefix), "buildAnnotationKey() = %v, should start with %v", got, prefix)
+
+			if tt.crVersion == nil {
+				namePart := got[len(prefix):]
+				assert.Len(t, namePart, 52, "buildAnnotationKey() name part should be a fixed-length hash. Got: %v", got)
+				assert.True(t, len(namePart) <= maxAnnotationNameLength, "buildAnnotationKey() name part length = %v, should be <= %v. Got: %v", len(namePart), maxAnnotationNameLength, got)
+			}
+		})
+	}
+}
+
 // trackingUpdateRolesClient extends noopMongoClient to track UpdateUserRoles calls.
 type trackingUpdateRolesClient struct {
 	noopMongoClient
@@ -743,7 +940,12 @@ func TestReconcileCustomUsers_SteadyStateNoShardConnections(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: api.PerconaServerMongoDBSpec{
-			Sharding: api.Sharding{Enabled: true},
+			CRVersion:               version.Version(),
+			ClusterServiceDNSMode:   api.DNSModeInternal,
+			ClusterServiceDNSSuffix: "svc.cluster.local",
+			TLS:                     &api.TLSSpec{Mode: api.TLSModeDisabled},
+			Secrets:                 &api.SecretsSpec{},
+			Sharding:                api.Sharding{Enabled: true, Mongos: &api.MongosSpec{}},
 			Replsets: []*api.ReplsetSpec{
 				{Name: "rs0"},
 				{Name: "rs1"},
@@ -844,7 +1046,12 @@ func TestReconcileCustomUsers_PasswordRotationPropagates(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: api.PerconaServerMongoDBSpec{
-			Sharding: api.Sharding{Enabled: true},
+			CRVersion:               version.Version(),
+			ClusterServiceDNSMode:   api.DNSModeInternal,
+			ClusterServiceDNSSuffix: "svc.cluster.local",
+			TLS:                     &api.TLSSpec{Mode: api.TLSModeDisabled},
+			Secrets:                 &api.SecretsSpec{},
+			Sharding:                api.Sharding{Enabled: true, Mongos: &api.MongosSpec{}},
 			Replsets: []*api.ReplsetSpec{
 				{Name: "rs0"},
 				{Name: "rs1"},
@@ -889,7 +1096,7 @@ func TestReconcileCustomUsers_PasswordRotationPropagates(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, newHash, updatedSecret.Annotations["percona.com/"+clusterName+"-clusterSuperAdmin-rs0-hash"])
 	assert.Equal(t, newHash, updatedSecret.Annotations["percona.com/"+clusterName+"-clusterSuperAdmin-rs1-hash"])
-	assert.Equal(t, newHash, updatedSecret.Annotations["percona.com/"+clusterName+"-clusterSuperAdmin-hash"])
+	assert.Equal(t, newHash, updatedSecret.Annotations[buildAnnotationKey(cr, "clusterSuperAdmin")])
 }
 
 // TestReconcileCustomUsers_PerShardSkip verifies that a shard with no committed
@@ -937,7 +1144,12 @@ func TestReconcileCustomUsers_PerShardSkip(t *testing.T) {
 			Namespace: ns,
 		},
 		Spec: api.PerconaServerMongoDBSpec{
-			Sharding: api.Sharding{Enabled: true},
+			CRVersion:               version.Version(),
+			ClusterServiceDNSMode:   api.DNSModeInternal,
+			ClusterServiceDNSSuffix: "svc.cluster.local",
+			TLS:                     &api.TLSSpec{Mode: api.TLSModeDisabled},
+			Secrets:                 &api.SecretsSpec{},
+			Sharding:                api.Sharding{Enabled: true, Mongos: &api.MongosSpec{}},
 			Replsets: []*api.ReplsetSpec{
 				{Name: "rs0"},
 				{Name: "rs1"},
@@ -974,4 +1186,28 @@ func TestReconcileCustomUsers_PerShardSkip(t *testing.T) {
 	assert.Equal(t, 1, tracker.mongosCount)
 	assert.Equal(t, []string{"rs1"}, tracker.shardCalls,
 		"only rs1 should be connected (rs0 has matching annotation)")
+}
+
+// TestBuildAnnotationKeyNoCollision ensures that two distinct users do not produce
+// the same annotation key, even when their cluster/user names share a long common
+// prefix that would have been truncated to an identical value by the old logic.
+func TestBuildAnnotationKeyNoCollision(t *testing.T) {
+	cr := &api.PerconaServerMongoDB{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      strings.Repeat("c", 20),
+			Namespace: "namespace",
+		},
+		Spec: api.PerconaServerMongoDBSpec{
+			CRVersion: version.Version(),
+		},
+	}
+
+	longPrefix := strings.Repeat("p", 42)
+	userNameA := longPrefix + strings.Repeat("a", 21)
+	userNameB := longPrefix + strings.Repeat("b", 21)
+
+	keyA := buildAnnotationKey(cr, userNameA)
+	keyB := buildAnnotationKey(cr, userNameB)
+
+	assert.NotEqual(t, keyA, keyB, "buildAnnotationKey() should produce distinct keys for distinct users, got %q for both", keyA)
 }

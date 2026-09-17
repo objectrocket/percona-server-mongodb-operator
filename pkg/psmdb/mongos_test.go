@@ -184,12 +184,12 @@ func TestMongosContainer(t *testing.T) {
 		},
 	}
 
-	container, err := mongosContainer(cr, false, []string{"cfg-0.test-cr-cfg.test-ns.svc.cluster.local:27017"})
+	container, err := mongosContainer(cr, false, []string{"cfg-0.test-cr-cfg.test-ns.svc.cluster.local:27017"}, cr.KeyFileAuthEnabled())
 	assert.NoError(t, err)
 
 	// Basic container fields
 	assert.Equal(t, "mongos", container.Name)
-	assert.Equal(t, "percona/percona-server-mongodb:8.0.19-7", container.Image)
+	assert.Equal(t, "percona/percona-server-mongodb:8.0.26-11", container.Image)
 	assert.Equal(t, corev1.PullAlways, container.ImagePullPolicy)
 	assert.Equal(t, "/data/db", container.WorkingDir)
 
@@ -302,4 +302,82 @@ func TestMongosStatefulsetSpec_PodManagementPolicy(t *testing.T) {
 		spec := MongosStatefulsetSpec(cr, template)
 		assert.Equal(t, appsv1.OrderedReadyPodManagement, spec.PodManagementPolicy)
 	})
+}
+
+func TestMongosServiceAnnotations(t *testing.T) {
+	tests := map[string]struct {
+		expose              api.MongosExpose
+		svcName             string
+		expectedAnnotations map[string]string
+	}{
+		"externalDNS single service: hostname without pod index": {
+			expose: api.MongosExpose{
+				Expose: api.Expose{
+					ExposeType: corev1.ServiceTypeLoadBalancer,
+					ExternalDNS: &api.ExternalDNSConfig{
+						Prefix: "prod",
+						Domain: "mongo.example.com",
+						TTL:    120,
+					},
+				},
+			},
+			svcName: "test-cr-mongos",
+			expectedAnnotations: map[string]string{
+				"external-dns.alpha.kubernetes.io/hostname": "prod-mongos.mongo.example.com",
+				"external-dns.alpha.kubernetes.io/ttl":      "120",
+				"percona.com/external-dns-managed":          "true",
+			},
+		},
+		"externalDNS servicePerPod: hostname with pod index": {
+			expose: api.MongosExpose{
+				ServicePerPod: true,
+				Expose: api.Expose{
+					ExposeType: corev1.ServiceTypeLoadBalancer,
+					ExternalDNS: &api.ExternalDNSConfig{
+						Prefix: "prod",
+						Domain: "mongo.example.com",
+					},
+				},
+			},
+			svcName: "test-cr-mongos-2",
+			expectedAnnotations: map[string]string{
+				"external-dns.alpha.kubernetes.io/hostname": "prod-mongos-2.mongo.example.com",
+				"percona.com/external-dns-managed":          "true",
+			},
+		},
+		"no externalDNS: only user annotations": {
+			expose: api.MongosExpose{
+				Expose: api.Expose{
+					ExposeType: corev1.ServiceTypeLoadBalancer,
+					ServiceAnnotations: map[string]string{
+						"percona.com/test": "annotation",
+					},
+				},
+			},
+			svcName: "test-cr-mongos",
+			expectedAnnotations: map[string]string{
+				"percona.com/test": "annotation",
+			},
+		},
+	}
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			cr := &api.PerconaServerMongoDB{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-cr",
+					Namespace: "test-ns",
+				},
+				Spec: api.PerconaServerMongoDBSpec{
+					CRVersion: version.Version(),
+					Sharding: api.Sharding{
+						Mongos: &api.MongosSpec{
+							Expose: tt.expose,
+						},
+					},
+				},
+			}
+			svc := MongosService(cr, tt.svcName)
+			assert.Equal(t, tt.expectedAnnotations, svc.Annotations)
+		})
+	}
 }

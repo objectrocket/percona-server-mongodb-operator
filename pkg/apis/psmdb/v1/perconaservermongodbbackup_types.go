@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	"github.com/percona/percona-backup-mongodb/pbm/compress"
 	"github.com/percona/percona-backup-mongodb/pbm/defs"
@@ -16,8 +17,13 @@ type PerconaServerMongoDBBackupSpec struct {
 	Compression      compress.CompressionType `json:"compressionType,omitempty"`
 	CompressionLevel *int                     `json:"compressionLevel,omitempty"`
 
-	// +kubebuilder:validation:Enum={logical,physical,incremental,incremental-base}
+	// +kubebuilder:validation:Enum={logical,physical,external,incremental,incremental-base}
 	Type defs.BackupType `json:"type,omitempty"`
+
+	// VolumeSnapshotClass is the name of the VolumeSnapshotClass to use for snapshot based backups.
+	// This may be specified only when type is `external`.
+	// +kubebuilder:validation:Optional
+	VolumeSnapshotClass *string `json:"volumeSnapshotClass,omitempty"`
 
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:default=120
@@ -45,10 +51,14 @@ type PerconaServerMongoDBBackupStatus struct {
 	Minio        *BackupStorageMinioSpec      `json:"minio,omitempty"`
 	GCS          *BackupStorageGCSSpec        `json:"gcs,omitempty"`
 	Azure        *BackupStorageAzureSpec      `json:"azure,omitempty"`
+	OSS          *BackupStorageOSSSpec        `json:"oss,omitempty"`
 	Filesystem   *BackupStorageFilesystemSpec `json:"filesystem,omitempty"`
+	OCI          *BackupStorageOCISpec        `json:"oci,omitempty"`
 	ReplsetNames []string                     `json:"replsetNames,omitempty"`
 	PBMname      string                       `json:"pbmName,omitempty"`
 	Size         string                       `json:"size,omitempty"`
+
+	Snapshots SnapshotInfos `json:"snapshots,omitempty"`
 
 	// Deprecated: Use PBMPods instead
 	PBMPod  string            `json:"pbmPod,omitempty"`
@@ -60,6 +70,25 @@ type PerconaServerMongoDBBackupStatus struct {
 	LastWriteAt          *metav1.Time `json:"lastWriteAt,omitempty"`
 	LastTransition       *metav1.Time `json:"lastTransition,omitempty"`
 	LatestRestorableTime *metav1.Time `json:"latestRestorableTime,omitempty"`
+}
+
+type SnapshotInfos []SnapshotInfo
+
+// SnapshotInfo contains information about a snapshot.
+type SnapshotInfo struct {
+	// ReplsetName is the name of the replset that the snapshot belongs to.
+	ReplsetName string `json:"replsetName,omitempty"`
+	// SnapshotName is the name of the snapshot.
+	SnapshotName string `json:"snapshotName,omitempty"`
+}
+
+func (s SnapshotInfos) GetSnapshotInfo(replsetName string) *SnapshotInfo {
+	for i := range s {
+		if s[i].ReplsetName == replsetName {
+			return &s[i]
+		}
+	}
+	return nil
 }
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -95,7 +124,10 @@ type PerconaServerMongoDBBackupList struct {
 }
 
 func (p *PerconaServerMongoDBBackup) CheckFields() error {
-	if len(p.Spec.StorageName) == 0 {
+	if p.Spec.Type == defs.ExternalBackup && ptr.Deref(p.Spec.VolumeSnapshotClass, "") == "" {
+		return fmt.Errorf("spec volumeSnapshotClass field is empty")
+	}
+	if len(p.Spec.StorageName) == 0 && p.Spec.Type != defs.ExternalBackup {
 		return fmt.Errorf("spec storageName field is empty")
 	}
 	if len(p.Spec.GetClusterName()) == 0 {
@@ -117,6 +149,9 @@ const (
 func (p *PerconaServerMongoDBBackup) PBMBackupType() defs.BackupType {
 	if p.Spec.Type == BackupTypeIncrementalBase {
 		return defs.IncrementalBackup
+	}
+	if p.Spec.Type == "" {
+		return defs.LogicalBackup
 	}
 	return p.Spec.Type
 }

@@ -9,6 +9,8 @@ spec:
 #    withUsersAndRoles: true
 #    namespaces:
 #    - "db.collection"
+#    nsFrom: "db1.col1"
+#    nsTo: "db1.col2"
 #  replsetRemapping:
 #    rs0: shard0
 #    rs1: shard1
@@ -29,6 +31,11 @@ spec:
 #      bucket: S3-BACKUP-BUCKET-NAME-HERE
 #      endpointUrl: https://s3.us-west-2.amazonaws.com/
 #      prefix: ""
+#    snapshots:
+#      - replsetName: rs0
+#        snapshotName: YOUR-RS0-SNAPSHOT-NAME
+#      - replsetName: cfg
+#        snapshotName: YOUR-CFG-SNAPSHOT-NAME
 #    azure:
 #      credentialsSecret: SECRET-NAME
 #      prefix: PREFIX-NAME

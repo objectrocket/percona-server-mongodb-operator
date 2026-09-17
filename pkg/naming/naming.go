@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	psmdbv1 "github.com/percona/percona-server-mongodb-operator/pkg/apis/psmdb/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 	ComponentNonVotingShort = "nv"
 	ComponentHidden         = "hidden"
 	ComponentArbiter        = "arbiter"
+	ComponentSearch         = "search"
 )
 
 const (
@@ -36,6 +38,7 @@ const (
 	ContainerNonVoting   = ContainerMongod + "-" + ComponentNonVotingShort
 	ContainerArbiter     = ContainerMongod + "-" + ComponentArbiter
 	ContainerHidden      = ContainerMongod + "-" + ComponentHidden
+	ContainerMongot      = "mongot"
 )
 
 func MongodStatefulSetName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
@@ -46,12 +49,28 @@ func MongodCustomConfigName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.Replse
 	return fmt.Sprintf("%s-%s-%s", cr.Name, rs.Name, ComponentMongod)
 }
 
+func MongosStatefulSetName(cr *psmdbv1.PerconaServerMongoDB) string {
+	return fmt.Sprintf("%s-%s", cr.Name, ComponentMongos)
+}
+
+func SearchStatefulSetName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
+	return fmt.Sprintf("%s-%s-%s", cr.Name, rs.Name, ComponentSearch)
+}
+
+func SearchConfigMapName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
+	return SearchStatefulSetName(cr, rs) + "-config"
+}
+
 func MongosCustomConfigName(cr *psmdbv1.PerconaServerMongoDB) string {
 	return fmt.Sprintf("%s-%s", cr.Name, ComponentMongos)
 }
 
 func NonVotingStatefulSetName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
 	return fmt.Sprintf("%s-%s-%s", cr.Name, rs.Name, ComponentNonVotingShort)
+}
+
+func NonVotingPodName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec, idx int) string {
+	return fmt.Sprintf("%s-%d", NonVotingStatefulSetName(cr, rs), idx)
 }
 
 func NonVotingConfigMapName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
@@ -64,6 +83,10 @@ func HiddenStatefulSetName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.Replset
 
 func HiddenConfigMapName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
 	return HiddenStatefulSetName(cr, rs)
+}
+
+func HiddenPodName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec, idx int) string {
+	return fmt.Sprintf("%s-%d", HiddenStatefulSetName(cr, rs), idx)
 }
 
 func ArbiterStatefulSetName(cr *psmdbv1.PerconaServerMongoDB, rs *psmdbv1.ReplsetSpec) string {
@@ -83,4 +106,16 @@ func MongosHookScriptConfigMapName(cr *psmdbv1.PerconaServerMongoDB) string {
 
 func PBMHookScriptConfigMapName(cr *psmdbv1.PerconaServerMongoDB) string {
 	return fmt.Sprintf("%s-pbm-hookscript", cr.Name)
+}
+
+func VolumeSnapshotName(bcp *psmdbv1.PerconaServerMongoDBBackup, rsName string) string {
+	return fmt.Sprintf("%s-%s", bcp.Name, rsName)
+}
+
+func ReplsetNamespacedName(cr *psmdbv1.PerconaServerMongoDB, rsName string) types.NamespacedName {
+	return types.NamespacedName{Name: cr.Name + "-" + rsName, Namespace: cr.Namespace}
+}
+
+func MongosNamespacedName(cr *psmdbv1.PerconaServerMongoDB) types.NamespacedName {
+	return types.NamespacedName{Name: cr.Name + "-" + "mongos", Namespace: cr.Namespace}
 }

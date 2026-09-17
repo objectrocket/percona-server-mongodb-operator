@@ -40,7 +40,6 @@ check_backup_and_restore() {
 
 	log "checking if balancer is disabled"
 	check_balancer ${cluster} "false"
-
 	wait_backup "${backup_name}" "ready"
 
 	log "checking if balancer is ${balancer_end_state} after backup"
@@ -52,7 +51,7 @@ check_backup_and_restore() {
 	wait_restore ${backup_name} ${cluster} "requested" 0
 
 	log "checking if balancer is disabled"
-	check_balancer ${cluster} "false"
+	check_balancer ${cluster} "false" 5
 
 	wait_restore ${backup_name} ${cluster} "ready" 1
 
@@ -64,27 +63,27 @@ write_data() {
 	local cluster=$1
 
 	log 'create user'
-	run_mongos \
+	run_mongosh_mongos \
 		'db.createUser({user:"user",pwd:"pass",roles:[{db:"app",role:"readWrite"}]})' \
 		"userAdmin:userAdmin123456@$cluster-mongos.$namespace" \
 		"mongodb" ".svc.cluster.local" "--quiet" "27017" "mongosh"
 	sleep 2
 
 	log 'enable sharding'
-	run_mongos \
+	run_mongosh_mongos \
 		'sh.enableSharding("app")' \
 		"clusterAdmin:clusterAdmin123456@$cluster-mongos.$namespace" \
 		"mongodb" ".svc.cluster.local" "--quiet" "27017" "mongosh"
 	sleep 2
 
 	log 'shard collection'
-	run_mongos \
+	run_mongosh_mongos \
 		'sh.shardCollection("app.city", { _id: 1 } )' \
 		"clusterAdmin:clusterAdmin123456@$cluster-mongos.$namespace" \
 		"mongodb" ".svc.cluster.local" "--quiet" "27017" "mongosh"
 
 	log 'write data (this can take some time, be patient)'
-	run_script_mongos "${test_dir}/data.js" "user:pass@$cluster-mongos.$namespace" \
+	run_script_mongosh_mongos "${test_dir}/data.js" "user:pass@$cluster-mongos.$namespace" \
 		"mongodb" ".svc.cluster.local" "--quiet" "mongosh"
 
 }

@@ -93,6 +93,8 @@ spec:
                   fieldPath: metadata.name
             - name: PBM_MONGODB_URI
               value: mongodb://$(PBM_AGENT_MONGODB_USERNAME):$(PBM_AGENT_MONGODB_PASSWORD)@localhost:$(PBM_MONGODB_PORT)/?tls=true&tlsCertificateKeyFile=/tmp/tls.pem&tlsCAFile=/etc/mongodb-ssl/ca.crt&tlsInsecure=true
+            - name: SSL_CERT_FILE
+              value: /etc/s3/certs/ca-bundle.crt
           envFrom:
             - secretRef:
                 name: internal-some-name-users
@@ -156,9 +158,6 @@ spec:
           volumeMounts:
             - mountPath: /data/db
               name: mongod-data
-            - mountPath: /etc/mongodb-secrets
-              name: some-name-mongodb-keyfile
-              readOnly: true
             - mountPath: /etc/mongodb-ssl
               name: ssl
               readOnly: true
@@ -179,6 +178,11 @@ spec:
             - mountPath: /etc/pbm/
               name: pbm-config
               readOnly: true
+            - mountPath: /etc/s3/certs-in
+              name: ca-bundle-in
+              readOnly: true
+            - mountPath: /etc/s3/certs
+              name: ca-bundle
           workingDir: /data/db
       dnsPolicy: ClusterFirst
       initContainers:
@@ -196,8 +200,6 @@ spec:
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
           volumeMounts:
-            - mountPath: /data/db
-              name: mongod-data
             - mountPath: /opt/percona
               name: bin
         - command:
@@ -210,8 +212,6 @@ spec:
           terminationMessagePath: /dev/termination-log
           terminationMessagePolicy: File
           volumeMounts:
-            - mountPath: /data/db
-              name: mongod-data
             - mountPath: /opt/percona
               name: bin
       restartPolicy: Always
@@ -222,11 +222,6 @@ spec:
       serviceAccountName: default
       terminationGracePeriodSeconds: 60
       volumes:
-        - name: some-name-mongodb-keyfile
-          secret:
-            defaultMode: 288
-            optional: false
-            secretName: some-name-mongodb-keyfile
         - emptyDir: {}
           name: bin
         - emptyDir: {}
