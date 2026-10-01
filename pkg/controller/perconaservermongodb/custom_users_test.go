@@ -576,6 +576,15 @@ func (c *noopMongoClient) UpdateUserRoles(ctx context.Context, db, username stri
 func (c *noopMongoClient) UpdateUser(ctx context.Context, currName, newName, pass string) error {
 	return nil
 }
+func (c *noopMongoClient) GetOplogSizeMB(ctx context.Context) (float64, error) {
+	return 0, nil
+}
+func (c *noopMongoClient) ResizeOplog(ctx context.Context, sizeMB float64) error {
+	return nil
+}
+func (c *noopMongoClient) CompactOplog(ctx context.Context) error {
+	return nil
+}
 func (c *noopMongoClient) GetRole(ctx context.Context, db, role string) (*mongo.Role, error) {
 	return nil, nil
 }
