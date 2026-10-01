@@ -113,6 +113,13 @@ type FCV struct {
 	OKResponse `bson:",inline"`
 }
 
+// OplogCollStats holds the subset of collStats used to read the configured
+// oplog size. maxSize is the capped collection's maximum size in bytes.
+type OplogCollStats struct {
+	MaxSize    float64 `bson:"maxSize" json:"maxSize"`
+	OKResponse `bson:",inline"`
+}
+
 const ShardRemoveCompleted string = "completed"
 
 type ShardRemoveResp struct {

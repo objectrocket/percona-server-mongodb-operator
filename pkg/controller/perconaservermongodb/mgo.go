@@ -291,6 +291,9 @@ func (r *ReconcilePerconaServerMongoDB) reconcileCluster(ctx context.Context, cr
 	}
 
 	if liveMembers == len(pods.Items) {
+		if err := r.reconcileOplogSize(ctx, cr, replset, cli); err != nil {
+			return api.AppStateError, rsMembers, errors.Wrap(err, "failed to reconcile oplog size")
+		}
 		return api.AppStateReady, rsMembers, nil
 	}
 

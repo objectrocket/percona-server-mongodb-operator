@@ -11,7 +11,21 @@ import (
 	"github.com/percona/percona-server-mongodb-operator/pkg/psmdb/mongo"
 )
 
-type fakeMongoClient struct{}
+type fakeMongoClient struct {
+	// OplogSizeMB is the configured oplog size the fake reports from
+	// GetOplogSizeMB. ResizeOplog updates it so repeated reads reflect the
+	// resize, letting tests exercise validation and no-op paths.
+	OplogSizeMB float64
+	// GetOplogSizeMBErr, ResizeOplogErr and CompactOplogErr force the matching
+	// method to return an error, simulating an unhealthy or crashed member.
+	GetOplogSizeMBErr error
+	ResizeOplogErr    error
+	CompactOplogErr   error
+	// ResizeOplogCalls and CompactOplogCalls count invocations so tests can
+	// assert idempotency (no spurious commands when sizes already match).
+	ResizeOplogCalls  int
+	CompactOplogCalls int
+}
 
 func NewClient() mongo.Client {
 	return &fakeMongoClient{}
@@ -148,4 +162,25 @@ func (c *fakeMongoClient) UpdateUserPass(ctx context.Context, db, name, pass str
 
 func (c *fakeMongoClient) UpdateUser(ctx context.Context, currName, newName, pass string) error {
 	return nil
+}
+
+func (c *fakeMongoClient) GetOplogSizeMB(ctx context.Context) (float64, error) {
+	if c.GetOplogSizeMBErr != nil {
+		return 0, c.GetOplogSizeMBErr
+	}
+	return c.OplogSizeMB, nil
+}
+
+func (c *fakeMongoClient) ResizeOplog(ctx context.Context, sizeMB float64) error {
+	c.ResizeOplogCalls++
+	if c.ResizeOplogErr != nil {
+		return c.ResizeOplogErr
+	}
+	c.OplogSizeMB = sizeMB
+	return nil
+}
+
+func (c *fakeMongoClient) CompactOplog(ctx context.Context) error {
+	c.CompactOplogCalls++
+	return c.CompactOplogErr
 }
