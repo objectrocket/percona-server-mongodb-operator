@@ -3,6 +3,7 @@ package perconaservermongodb
 import (
 	"context"
 	"io"
+	"strconv"
 	"testing"
 
 	"github.com/pkg/errors"
@@ -136,7 +137,7 @@ func setupOplogTest(t *testing.T, conf api.MongoConfiguration, clusterRole api.C
 	objs = append(objs, fakeStatefulset(cr, rs, rs.Size, "rev", naming.ComponentMongod))
 	pods := make([]client.Object, 0, 3)
 	for i := 0; i < 3; i++ {
-		p := fakeMongodPod(cr, rs, cr.Name+"-"+rs.Name+"-"+itoa(i))
+		p := fakeMongodPod(cr, rs, cr.Name+"-"+rs.Name+"-"+strconv.Itoa(i))
 		p.Labels[naming.LabelKubernetesComponent] = naming.ComponentMongod
 		pods = append(pods, p)
 		objs = append(objs, p)
@@ -169,7 +170,7 @@ func setupOplogTest(t *testing.T, conf api.MongoConfiguration, clusterRole api.C
 func seedMembers(t *testing.T, cr *api.PerconaServerMongoDB, rs *api.ReplsetSpec, provider *oplogClientProvider, startSizeMB float64) {
 	t.Helper()
 	for i := 0; i < int(rs.Size); i++ {
-		host := provider.hostFor(cr.Name + "-" + rs.Name + "-" + itoa(i))
+		host := provider.hostFor(cr.Name + "-" + rs.Name + "-" + strconv.Itoa(i))
 		require.NotEmpty(t, host)
 		state := mongo.MemberStateSecondary
 		if i == 0 {
@@ -292,8 +293,4 @@ func TestReconcileOplogSize(t *testing.T) {
 			assert.Equalf(t, 0, st.compactCalls, "no compact on gated decrease for %s", host)
 		}
 	})
-}
-
-func itoa(i int) string {
-	return string(rune('0' + i))
 }
