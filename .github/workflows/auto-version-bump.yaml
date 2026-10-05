@@ -194,6 +194,29 @@ jobs:
             echo "Fixed missing trailing newline in $VERSION_FILE"
           fi
 
+      - name: Set up Go
+        if: steps.label.outputs.type != '' && steps.bump.outputs.bumped == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Regenerate CRD version labels
+        if: steps.label.outputs.type != '' && steps.bump.outputs.bumped == 'true'
+        run: |
+          # Install yq (used by the go:generate directives in pkg/version/version.go)
+          # into a dir on PATH so `make generate` can set the version labels.
+          mkdir -p bin
+          GOBIN="$(pwd)/bin" go install github.com/mikefarah/yq/v4@latest
+          export PATH="$(pwd)/bin:$PATH"
+          # Regenerate the CRD version-label patch files (make generate) and the
+          # committed deploy/crd.yaml (the crd.yaml target), so they match the
+          # bumped pkg/version/version.txt. Same entrypoints used to fix the
+          # drift manually. make generate installs controller-gen; the crd.yaml
+          # target installs kustomize.
+          make generate
+          make deploy/crd.yaml
+
       - name: Commit and push
         if: steps.label.outputs.type != ''
         run: |
