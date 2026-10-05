@@ -29,9 +29,6 @@ const allowOplogDecrease = false
 // oplogSizeMB when creating the oplog, so an existing oplog.rs keeps its old
 // size across restarts and must be resized with replSetResizeOplog.
 //
-// Config-server replica sets are excluded by default: their corrected value is
-// tracked separately in LIB-1368.
-//
 // The reconcile is a no-op once every member already matches the desired size,
 // and must only run after the set is confirmed stable (all pods live). It
 // returns an error to requeue if a member becomes unhealthy mid-resize.
@@ -39,10 +36,6 @@ func (r *ReconcilePerconaServerMongoDB) reconcileOplogSize(ctx context.Context, 
 	log := logf.FromContext(ctx)
 
 	if cr.Spec.Unmanaged {
-		return nil
-	}
-
-	if replset.ClusterRole == api.ClusterRoleConfigSvr || replset.Name == api.ConfigReplSetName {
 		return nil
 	}
 

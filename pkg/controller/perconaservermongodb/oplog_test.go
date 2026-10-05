@@ -264,7 +264,7 @@ func TestReconcileOplogSize(t *testing.T) {
 		}
 	})
 
-	t.Run("config-server replset is excluded", func(t *testing.T) {
+	t.Run("config-server replset is reconciled", func(t *testing.T) {
 		r, cr, rs, provider := setupOplogTest(t, "replication:\n  oplogSizeMB: 2000", api.ClusterRoleConfigSvr, "cfg")
 		seedMembers(t, cr, rs, provider, 990)
 
@@ -273,8 +273,10 @@ func TestReconcileOplogSize(t *testing.T) {
 
 		require.NoError(t, r.reconcileOplogSize(ctx, cr, rs, cli))
 
-		for _, st := range provider.byHost {
-			assert.Equal(t, 0, st.resizeCalls, "cfg replset must not be resized")
+		for host, st := range provider.byHost {
+			assert.Equalf(t, float64(2000), st.sizeMB, "cfg member %s resized", host)
+			assert.Equalf(t, 1, st.resizeCalls, "cfg member %s resized once", host)
+			assert.Equalf(t, 0, st.compactCalls, "no compact on increase for %s", host)
 		}
 	})
 

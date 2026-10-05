@@ -34,9 +34,3 @@ space. `compact` blocks replication on the member it runs against, so the
 primary is stepped down before its compact. The decrease path is disabled by
 default (`allowOplogDecrease`) pending review of the compact impact; the
 increase path is the primary deliverable.
-
-## Config-server exclusion
-
-Config-server replica sets (`clusterRole: configsvr`, or the reserved `cfg`
-replset name) are excluded from this reconcile by default. Their corrected oplog
-value is tracked separately in LIB-1368.
