@@ -820,6 +820,22 @@ func (conf MongoConfiguration) GetPort() (int32, error) {
 	return cfg.Net.Port, nil
 }
 
+// GetOplogSizeMB returns the replication.oplogSizeMB of the mongo configuration.
+// A zero value means the field is unset in the configuration.
+// https://www.mongodb.com/docs/manual/reference/configuration-options/#mongodb-setting-replication.oplogSizeMB
+func (conf MongoConfiguration) GetOplogSizeMB() (int, error) {
+	var cfg struct {
+		Replication struct {
+			OplogSizeMB int `yaml:"oplogSizeMB,omitempty"`
+		} `yaml:"replication,omitempty"`
+	}
+	err := yaml.Unmarshal([]byte(conf), &cfg)
+	if err != nil {
+		return 0, fmt.Errorf("error unmarshalling configuration %v", err)
+	}
+	return cfg.Replication.OplogSizeMB, nil
+}
+
 // SetPort to set the mongo port in the MongoConfiguration according to the following documentation:
 // https://www.mongodb.com/docs/manual/reference/configuration-options/#mongodb-setting-net.port.
 // Caution using this since it overwrites the MongoConfiguration.

@@ -51,6 +51,52 @@ func TestMongoConfiguration_GetPort(t *testing.T) {
 	}
 }
 
+func TestMongoConfiguration_GetOplogSizeMB(t *testing.T) {
+	tests := map[string]struct {
+		conf        MongoConfiguration
+		expectSize  int
+		expectError bool
+	}{
+		"valid oplog size": {
+			conf: `replication:
+  oplogSizeMB: 2000`,
+			expectSize: 2000,
+		},
+		"unset returns zero": {
+			conf:       ``,
+			expectSize: 0,
+		},
+		"replication section without oplogSizeMB": {
+			conf: `replication:
+  replSetName: rs0`,
+			expectSize: 0,
+		},
+		"other sections only": {
+			conf: `net:
+  port: 27017`,
+			expectSize: 0,
+		},
+		"invalid oplog size type": {
+			conf: `replication:
+  oplogSizeMB: invalid`,
+			expectError: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			size, err := tt.conf.GetOplogSizeMB()
+			if tt.expectError {
+				assert.Error(t, err)
+				assert.Equal(t, 0, size)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectSize, size)
+			}
+		})
+	}
+}
+
 func TestMongoConfiguration_SetPort(t *testing.T) {
 	tests := map[string]struct {
 		expectedConf MongoConfiguration

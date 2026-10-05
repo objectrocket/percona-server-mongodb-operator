@@ -139,6 +139,9 @@ type Client interface {
 	UpdateUserRoles(ctx context.Context, db, username string, roles []Role) error
 	UpdateUserPass(ctx context.Context, db, name, pass string) error
 	UpdateUser(ctx context.Context, currName, newName, pass string) error
+	GetOplogSizeMB(ctx context.Context) (float64, error)
+	ResizeOplog(ctx context.Context, sizeMB float64) error
+	CompactOplog(ctx context.Context) error
 }
 
 type ClientDatabase interface {
@@ -758,6 +761,76 @@ func (client *mongoClient) UpdateUser(ctx context.Context, currName, newName, pa
 
 	err = client.Database("admin").RunCommand(ctx, bson.D{{Key: "dropUser", Value: currName}}).Err()
 	return errors.Wrap(err, "drop user")
+}
+
+// GetOplogSizeMB returns the configured maximum size of the local oplog.rs
+// collection in megabytes, read via collStats on the local database.
+func (client *mongoClient) GetOplogSizeMB(ctx context.Context) (float64, error) {
+	resp := OplogCollStats{}
+
+	res := client.Database("local").RunCommand(ctx, bson.D{{Key: "collStats", Value: "oplog.rs"}})
+	if res.Err() != nil {
+		return 0, errors.Wrap(res.Err(), "collStats oplog.rs")
+	}
+
+	if err := res.Decode(&resp); err != nil {
+		return 0, errors.Wrap(err, "failed to decode collStats response")
+	}
+
+	if resp.OK != 1 {
+		return 0, errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+
+	return resp.MaxSize / (1024 * 1024), nil
+}
+
+// ResizeOplog resizes the live oplog of the connected mongod via
+// replSetResizeOplog. The command is node-local and does not replicate, so it
+// must be issued against each member individually. size must be sent as a BSON
+// Double; MongoDB rejects an integer value.
+func (client *mongoClient) ResizeOplog(ctx context.Context, sizeMB float64) error {
+	resp := OKResponse{}
+
+	res := client.Database("admin").RunCommand(ctx, bson.D{
+		{Key: "replSetResizeOplog", Value: 1},
+		{Key: "size", Value: sizeMB},
+	})
+	if res.Err() != nil {
+		return errors.Wrap(res.Err(), "replSetResizeOplog")
+	}
+
+	if err := res.Decode(&resp); err != nil {
+		return errors.Wrap(err, "failed to decode replSetResizeOplog response")
+	}
+
+	if resp.OK != 1 {
+		return errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+
+	return nil
+}
+
+// CompactOplog reclaims disk space released by an oplog shrink via compact on
+// the local oplog.rs collection. compact blocks replication on the member it
+// runs against, so it must only be issued against secondaries (or a stepped
+// down former primary).
+func (client *mongoClient) CompactOplog(ctx context.Context) error {
+	resp := OKResponse{}
+
+	res := client.Database("local").RunCommand(ctx, bson.D{{Key: "compact", Value: "oplog.rs"}})
+	if res.Err() != nil {
+		return errors.Wrap(res.Err(), "compact oplog.rs")
+	}
+
+	if err := res.Decode(&resp); err != nil {
+		return errors.Wrap(err, "failed to decode compact response")
+	}
+
+	if resp.OK != 1 {
+		return errors.Errorf("mongo says: %s", resp.Errmsg)
+	}
+
+	return nil
 }
 
 // RemoveOld removes from the list those members which are not present in the given list.
