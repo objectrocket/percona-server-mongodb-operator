@@ -1,30 +1,11 @@
-**CHANGE DESCRIPTION**
----
-**Problem:**
-*Short explanation of the problem.*
+## Description
+<!-- What does this PR change and why? -->
 
-**Cause:**
-*Short explanation of the root cause of the issue if applicable.*
+### Relevant tickets / references
+<!-- Jira card(s), related PRs, upstream issues/commits if this tracks an upstream change. -->
 
-**Solution:**
-*Short explanation of the solution we are providing with this PR.*
-
-**CHECKLIST**
----
-**Jira**
-- [ ] Is the Jira ticket created and referenced properly?
-- [ ] Does the Jira ticket have the proper statuses for documentation (`Needs Doc`) and QA (`Needs QA`)?
-- [ ] Does the Jira ticket link to the proper milestone (Fix Version field)?
-
-**Tests**
-- [ ] Is an E2E test/test case added for the new feature/change?
-- [ ] Are unit tests added where appropriate?
-- [ ] Are OpenShift compare files changed for E2E tests (`compare/*-oc.yml`)?
-
-**Config/Logging/Testability**
-- [ ] Are all needed new/changed options added to default YAML files?
-- [ ] Are all needed new/changed options added to the [Helm Chart](https://github.com/percona/percona-helm-charts)?
-- [ ] Did we add proper logging messages for operator actions?
-- [ ] Did we ensure compatibility with the previous version or cluster upgrade process?
-- [ ] Does the change support oldest and newest supported MongoDB version?
-- [ ] Does the change support oldest and newest supported Kubernetes version?
+## Checklist
+- [ ] Code changes under `pkg/`, `cmd/`, `build/`, `config/`, or `deploy/` carry exactly one version bump label: `bump:patch`, `bump:minor`, or `bump:major` (auto-bumps `pkg/version/version.txt`).
+- [ ] Non-shipping changes (docs, CI, `.github/`) use `skip-release` instead of a bump label.
+- [ ] Unit tests added/updated where appropriate.
+- [ ] If this merges upstream changes, the objectrocket customizations were preserved.
