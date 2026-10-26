@@ -200,7 +200,7 @@ jobs:
           cp deploy/cw-bundle.yaml artifacts/
 
       - name: Upload CRDs and RBAC artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: operator-manifests
           path: artifacts/
