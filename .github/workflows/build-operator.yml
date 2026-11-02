@@ -142,7 +142,7 @@ jobs:
             org.opencontainers.image.created=${{ steps.meta.outputs.build_time }}
 
       - name: Build and push operator image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./build/Dockerfile
