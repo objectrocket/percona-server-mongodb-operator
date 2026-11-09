@@ -4,7 +4,7 @@ go 1.27.1
 
 require (
 	github.com/Percona-Lab/percona-version-service v0.0.0-20230216094301-f9489c81b52a
-	github.com/alecthomas/kingpin v2.2.6+incompatible
+	github.com/alecthomas/kingpin v2.4.0+incompatible
 	github.com/cert-manager/cert-manager v1.21.3
 	github.com/go-logr/logr v1.4.4
 	github.com/go-openapi/errors v0.22.9
